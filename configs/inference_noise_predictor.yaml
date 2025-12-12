@@ -1,0 +1,88 @@
+# 噪声预测器推理配置文件
+# 用于加载训练好的噪声预测器进行超分辨率推理
+
+# 模型路径配置
+model:
+  noise_predictor_path: "SR/pretrained/best_model.pth"  # 训练好的噪声预测器权重
+  resshift_path: "SR/pretrained/resshift_realsrx4_s4_v3.pth"  # ResShift预训练权重
+  vae_path: "SR/pretrained/autoencoder_vq_f4.pth"  # VAE权重
+
+# VAE配置（与训练时保持一致）
+vae:
+  lora:
+    rank: 8  # LoRA的秩
+    alpha: 1.0  # LoRA的缩放因子
+    tune_decoder: false  # 是否对解码器应用LoRA微调
+
+# ResShift UNet配置（与训练时保持一致）
+resshift_unet:
+  image_size: 64  # 潜在空间尺寸
+  in_channels: 3  # VAE潜在空间通道数
+  model_channels: 160
+  out_channels: 3
+  attention_resolutions: [64, 32, 16, 8]
+  channel_mult: [1, 2, 2, 4]
+  num_res_blocks: [2, 2, 2, 2]
+  num_head_channels: 32
+  use_scale_shift_norm: true
+  resblock_updown: false
+  swin_depth: 2
+  swin_embed_dim: 192
+  window_size: 8
+  mlp_ratio: 4
+  cond_lq: true
+  lq_size: 64
+  dropout: 0.0
+  use_fp16: false
+  conv_resample: true
+  dims: 2
+  patch_norm: false
+
+# 噪声预测器配置（与训练时保持一致）
+noise_predictor:
+  latent_channels: 3  # VAE潜在空间通道数
+  model_channels: 160  # 基础通道数
+  channel_mult: [1, 2, 3]  # 通道倍增因子
+  num_res_blocks: 2  # 每层的残差块数量
+  attention_levels: 2  # 使用注意力的层数
+  num_heads: 10  # 注意力头数
+  use_cross_attention: true  # 使用交叉注意力
+  use_frequency_aware: true  # 使用频域感知
+  use_xformers: true  # 使用xFormers加速
+
+# 扩散过程配置（ResShift v3参数）
+diffusion:
+  num_timesteps: 4  # ResShift v3使用4步（注意：这里直接设置为采样步数）
+  kappa: 2.0  # ResShift v3的κ参数
+  eta_schedule: "exponential"  # eta调度类型
+  eta_power: 0.3  # 指数调度的幂次（ResShift v3使用0.3）
+  min_noise_level: 0.2  # 最小噪声水平（ResShift v3使用0.2）
+  etas_end: 0.99  # 最大噪声水平
+  normalize_input: true  # 输入归一化（重要！）
+  latent_flag: true  # 潜在空间标志
+  scale_factor: 1.0  # 缩放因子
+  
+# 推理配置
+inference:
+  num_steps: 4  # 采样步数（与ResShift v3一致）
+  scale_factor: 4  # 超分倍数
+  
+  # 噪声生成方式
+  use_random_noise: false  # true: 使用随机噪声(原始ResShift), false: 使用噪声预测器
+  
+  # Padding配置
+  padding_offset: 64  # Padding到64的倍数（与ResShift保持一致）
+  
+  # Chop分块配置（处理大图像）
+  chop_size: 256  # 分块大小
+  chop_stride: 224  # 分块步长
+  chop_bs: 1  # 每次处理的分块数
+  
+  # 设备配置
+  device: "cuda"
+  use_amp: true  # 使用混合精度加速
+  seed: 12345  # 随机种子
+  
+  # 输出配置
+  save_format: "png"  # 输出格式
+  rgb2bgr: true  # 是否转换为BGR（OpenCV格式）

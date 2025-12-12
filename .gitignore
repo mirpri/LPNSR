@@ -1,0 +1,26 @@
+# 1. 递归忽略所有目录下的__pycache__
+**/__pycache__/
+
+# 2. 忽略Python字节码文件（递归）
+*.pyc
+*.pyo
+*.pyd
+
+# 3. 忽略Python编译优化文件
+*.so
+
+# 4. 忽略虚拟环境
+.python-version
+env/
+venv/
+
+# 5. 忽略PyTorch权重文件（递归）
+*.pt
+*.pth
+*.pth.tar
+*.ckpt
+*.ckpt.index
+*.ckpt.data*
+*.tmp
+*.bak
+*.swp

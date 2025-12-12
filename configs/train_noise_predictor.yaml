@@ -1,0 +1,215 @@
+# 端到端训练噪声预测器的配置文件
+# 训练思路：通过完整的反向采样过程，计算SR与HR的损失来训练噪声预测器
+
+# ============================================================================
+# 实验设置
+# ============================================================================
+experiment:
+  name: "noise_predictor"
+  save_dir: "SR/experiments/noise_predictor"
+  keep_recent_checkpoints: 5  # 保留最近N个checkpoint
+  log_interval: 10  # 每N步打印一次日志
+  save_interval: 1  # 每N个epoch保存一次checkpoint
+  val_interval: 1  # 每N个epoch验证一次
+
+# ============================================================================
+# ResShift预训练模型路径（使用SR文件夹下的模型）
+# ============================================================================
+resshift:
+  # VAE配置文件路径
+  vae_config_path: "SR/configs/vqvae_config.yaml"
+  
+  # VAE模型路径（冻结）
+  vae_path: "SR/pretrained/autoencoder_vq_f4.pth"
+  
+  # UNet配置文件路径
+  unet_config_path: "SR/configs/unet_config.yaml"
+  
+  # ResShift UNet模型路径（冻结）
+  unet_path: "SR/pretrained/resshift_realsrx4_s4_v3.pth"
+
+# ============================================================================
+# 噪声预测器配置
+# ============================================================================
+noise_predictor:
+  latent_channels: 3  # VAE潜在空间通道数
+  model_channels: 160  # 基础通道数
+  channel_mult: [1, 2, 3]  # 通道倍增因子
+  num_res_blocks: 2  # 每层的残差块数量
+  attention_levels: 2  # 使用注意力的层数
+  num_heads: 10  # 注意力头数
+  use_cross_attention: true  # 使用交叉注意力
+  use_frequency_aware: true  # 使用频域感知
+  use_xformers: true  # 使用xFormers加速
+
+# ============================================================================
+# 训练设置
+# ============================================================================
+training:
+  # 基础设置
+  num_epochs: 200
+  batch_size: 4  # crop_size=256时使用4
+  num_workers: 4
+  
+  # ResShift扩散过程超参数（ResShift v3配置）
+  # 参考论文：ResShift: Efficient Diffusion Model for Image Super-resolution by Residual Shifting
+  # 关键区别：ResShift使用残差偏移扩散，而非标准DDPM的纯噪声扩散
+  # 注意：ResShift v3直接用4步训练，不需要时间步重映射！
+  diffusion:
+    # 总扩散步数T（ResShift v3直接用4步训练！）
+    num_timesteps: 4
+    
+    # ========== ResShift v3参数 ==========
+    # κ (kappa)：方差控制参数（ResShift v3使用2.0）
+    # 控制扩散过程中噪声的方差尺度
+    kappa: 2.0
+    
+    # η调度类型（ResShift使用eta而非beta）
+    # - exponential: 指数调度（ResShift默认）
+    # - ldm: 从.mat文件加载（需要提供mat_path）
+    eta_schedule: "exponential"
+    
+    # η_1：最小噪声水平（ResShift v3使用0.2）
+    # 控制扩散过程开始时向LR图像偏移的程度
+    min_noise_level: 0.2
+    
+    # η_T：最大噪声水平（论文中通常为0.99）
+    # 控制扩散过程结束时向LR图像偏移的程度
+    etas_end: 0.99
+    
+    # 指数调度的幂次（ResShift v3使用0.3）
+    # 控制η增长的速度，power越大增长越快
+    eta_power: 0.3
+    
+    # 输入归一化（重要！ResShift原项目使用）
+    normalize_input: true
+    latent_flag: true
+    
+    # 说明：
+    # ResShift的扩散过程与DDPM完全不同！
+    # - 前向过程：q(x_t|x_0,y) = N(x_t; η_t·(y-x_0)+x_0, η_t·κ²·I)
+    #   采样公式：x_t = (1-η_t)·x_0 + η_t·y + √η_t·κ·ε
+    # - 后验分布：q(x_{t-1}|x_t,x_0) = N(x_{t-1}; μ̃_t, σ̃_t²·I)
+    #   其中：μ̃_t = (η_{t-1}/η_t)·x_t + (α_t/η_t)·x_0
+    #        σ̃_t² = κ²·(η_{t-1}/η_t)·α_t
+    #        α_t = η_t - η_{t-1}（增量）
+    # - 初始化：x_T ~ N(y, κ²·η_T·I)
+    #   采样公式：x_T = y + κ·√η_T·ε
+    # 
+    # 关键创新：
+    # 1. 残差偏移：扩散过程向LR图像y偏移，而非向纯噪声偏移
+    # 2. 条件扩散：前向过程依赖于y（LR图像）
+    # 3. 预测x_0：模型直接预测干净图像，而非噪声
+    
+  # 采样设置
+  sampling_steps: 4  # 反向采样步数S（与num_timesteps一致，ResShift v3用4步）
+  # 注意：初始化从N(y, κ²·η_T·I)采样，κ在diffusion.kappa中设置
+  
+  # 优化技巧
+  use_amp: true  # 混合精度训练
+  use_ema: true  # 指数移动平均
+  ema_decay: 0.9999
+  use_gradient_checkpointing: true  # 梯度检查点
+  gradient_clip: 1.0  # 梯度裁剪
+  gradient_accumulation_steps: 1  # 梯度累积步数
+  
+  # 学习率预热
+  warmup_epochs: 5
+  warmup_lr: 1.0e-6
+
+# ============================================================================
+# 数据设置
+# ============================================================================
+data:
+  # 训练数据
+  train:
+    hr_dir: "SR/traindata"  # HR图像目录
+    lr_dir: null  # LR图像目录（如果为null，则通过退化生成）
+    crop_size: 256  # 裁剪大小（必须是256，与预训练ResShift模型匹配）
+    scale: 4  # 超分倍数
+    
+    # 数据增强
+    use_flip: true
+    use_rot: true
+    use_color_jitter: false
+    
+  # 验证数据
+  val:
+    hr_dir: null
+    lr_dir: null
+    crop_size: 256  # 必须是256，与预训练ResShift模型匹配
+    scale: 4
+
+# ============================================================================
+# 退化设置（如果需要生成LR图像）
+# ============================================================================
+degradation:
+  use_degradation: true  # 是否使用退化生成LR
+  config_path: "SR/configs/realesrgan_degradation.yaml"
+
+# ============================================================================
+# 损失函数设置
+# ============================================================================
+loss:
+  # L2损失
+  l2_weight: 1.0
+  
+  # 频域感知损失
+  freq_weight: 0.1
+  freq_alpha: 1.0  # FocalFrequencyLoss的alpha参数
+  
+  # 统计特征损失
+  stat_weight: 0.1
+  stat_window_sizes: [3, 5, 7]  # 多尺度窗口
+
+# ============================================================================
+# 优化器设置
+# ============================================================================
+optimizer:
+  type: "AdamW"  # Adam 或 AdamW
+  lr: 5.0e-5
+  beta1: 0.9
+  beta2: 0.999
+  weight_decay: 1.0e-4
+
+# ============================================================================
+# 学习率调度器设置
+# ============================================================================
+scheduler:
+  type: "CosineAnnealing"  # CosineAnnealing 或 StepLR
+  
+  # CosineAnnealing参数
+  min_lr: 1.0e-6
+  
+  # StepLR参数
+  step_size: 50
+  gamma: 0.5
+
+# ============================================================================
+# 验证设置
+# ============================================================================
+validation:
+  num_samples: 4  # 验证时生成的样本数
+  save_images: true  # 是否保存验证图像
+  compute_metrics: true  # 是否计算指标（PSNR, SSIM等）
+
+# ============================================================================
+# 日志设置
+# ============================================================================
+logging:
+  use_tensorboard: true
+  tensorboard_dir: "SR/experiments/tensorboard"
+  
+  # 打印设置
+  print_freq: 10  # 每N步打印一次
+  
+  # 保存设置
+  save_freq: 1000  # 每N步保存一次可视化结果
+
+# ============================================================================
+# 硬件设置
+# ============================================================================
+hardware:
+  gpu_ids: [0]  # 使用的GPU ID
+  distributed: false  # 是否使用分布式训练
+  find_unused_parameters: false  # DDP设置
