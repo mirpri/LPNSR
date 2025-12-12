@@ -680,7 +680,7 @@ def test_degradation():
     degrader = RealESRGANDegradation(str(config_path))
     
     # 读取traindata目录下的图像
-    traindata_dir = Path(__file__).parent.parent / 'traindata'
+    traindata_dir = Path(__file__).parent.parent / 'results'
     image_files = glob.glob(str(traindata_dir / '*.png')) + glob.glob(str(traindata_dir / '*.jpg')) + glob.glob(str(traindata_dir / '*.jpeg'))
     
     if not image_files:

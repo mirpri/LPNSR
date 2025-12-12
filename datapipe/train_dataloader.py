@@ -56,11 +56,12 @@ class RealESRGANTrainDataset(Dataset):
         if image_extensions is None:
             image_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp']
         
-        # 加载所有图像路径
+        # 加载所有图像路径 - 递归搜索多级目录
         self.image_paths = []
         for ext in image_extensions:
-            self.image_paths.extend(glob.glob(str(self.data_dir / f'*{ext}')))
-            self.image_paths.extend(glob.glob(str(self.data_dir / f'*{ext.upper()}')))
+            self.image_paths.extend(glob.glob(str(self.data_dir / '**' / f'*{ext}'), recursive=True))
+            self.image_paths.extend(glob.glob(str(self.data_dir / '**' / f'*{ext.upper()}'), recursive=True))
+        self.image_paths = list(set(self.image_paths))
         
         if len(self.image_paths) == 0:
             raise ValueError(f"在目录 {data_dir} 中没有找到任何图像文件")

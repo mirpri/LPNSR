@@ -48,7 +48,7 @@ noise_predictor:
 training:
   # 基础设置
   num_epochs: 200
-  batch_size: 4  # crop_size=256时使用4
+  batch_size: 8
   num_workers: 4
   
   # ResShift扩散过程超参数（ResShift v3配置）
@@ -155,11 +155,11 @@ loss:
   l2_weight: 1.0
   
   # 频域感知损失
-  freq_weight: 0.1
+  freq_weight: 2.0
   freq_alpha: 1.0  # FocalFrequencyLoss的alpha参数
   
   # LPIPS感知损失
-  lpips_weight: 0.1
+  lpips_weight: 2.0
   lpips_net_type: 'alex'  # 可选: 'alex', 'vgg', 'squeeze'
 
 # ============================================================================
