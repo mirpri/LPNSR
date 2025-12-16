@@ -96,7 +96,8 @@ optimizer:
 python -m SR.train_noise_predictor --config SR/configs/train_noise_predictor.yaml
 
 # 从checkpoint恢复训练
-python -m SR.train_noise_predictor --config SR/configs/train_noise_predictor.yaml --resume SR/experiments/noise_predictor/checkpoints/checkpoint_epoch_50.pth
+python -m SR.train_noise_predictor --config SR/configs/train_noise_predictor.yaml 
+--resume SR/experiments/noise_predictor/checkpoints/checkpoint_epoch_50.pth
 ```
 
 ### 4. 监控训练
