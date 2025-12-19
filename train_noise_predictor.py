@@ -1,22 +1,23 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-单步训练噪声预测器（类似 ResShift 和 InvSR）
+多步端到端训练噪声预测器（与推理流程完全一致）
 
 训练思路：
 1. 输入HR图像和LR图像
 2. 使用冻结的VAE编码到潜在空间
-3. 随机采样一个时间步t
-4. 使用前向扩散 q_sample 从 z_0 (HR) 扩散到 z_t
-5. 噪声预测器预测该时间步的噪声
-6. 使用冻结的ResShift UNet从z_t预测z_0
-7. 计算损失：预测z_0与真实z_0的MSE
-8. 反向传播，只更新噪声预测器
+3. 使用噪声预测器初始化 x_T = z_y + κ·√η_T·ε
+4. 多步反向采样（与推理完全一致）：
+   - UNet预测x_0
+   - 噪声预测器预测采样噪声
+   - 后验采样得到x_{t-1}
+5. 计算最终x_0与真实z_start的损失
+6. 反向传播，只更新噪声预测器
 
-关键：单步训练，不需要走完整采样过程！
+关键：多步训练与推理流程完全一致，避免训练-推理不一致问题！
 - 使用eta调度而非beta调度
 - 残差偏移扩散：x_t = (1-η_t)·x_0 + η_t·y + √η_t·κ·ε
-- 前向扩散：q(x_t | x_0, y) = N(x_t; η_t·(y-x_0)+x_0, η_t·κ²·I)
+- 后验分布：μ = (η_{t-1}/η_t)·x_t + (α_t/η_t)·x_0
 """
 
 import os
@@ -628,36 +629,6 @@ class NoisePredictorTrainer:
 
         return posterior_mean, posterior_variance, posterior_log_variance
 
-    def q_sample(self, z_start, z_y, t, noise=None):
-        """
-        前向扩散：从 z_0 扩散到 z_t
-
-        ResShift 前向扩散公式：
-        q(x_t | x_0, y) = N(x_t; η_t·(y-x_0)+x_0, η_t·κ²·I)
-        x_t = η_t·(y - x_0) + x_0 + √η_t·κ·ε
-            = (1 - η_t)·x_0 + η_t·y + √η_t·κ·ε
-
-        Args:
-            z_start: HR图像的潜在表示 z_0 [B, C, H, W]
-            z_y: LR图像的潜在表示 y [B, C, H, W]
-            t: 时间步索引 [B]
-            noise: 可选，指定的噪声
-
-        Returns:
-            z_t: 时间步t的含噪潜在表示
-        """
-        if noise is None:
-            noise = torch.randn_like(z_start)
-
-        # x_t = η_t·(y - x_0) + x_0 + √η_t·κ·ε
-        #     = (1 - η_t)·x_0 + η_t·y + √η_t·κ·ε
-        etas_t = self._extract(self.etas, t, z_start.shape)
-        sqrt_etas_t = self._extract(self.sqrt_etas, t, z_start.shape)
-
-        z_t = etas_t * (z_y - z_start) + z_start + sqrt_etas_t * self.kappa * noise
-
-        return z_t
-
     @torch.no_grad()
     def p_sample_with_noise_predictor(self, x_t, y, lr_image, t_tensor):
         """
@@ -854,17 +825,29 @@ class NoisePredictorTrainer:
         loss_dict['l2'] = l2.item()
         total_loss += loss_config['l2_weight'] * l2
 
-        # 频域损失
-        if self.freq_loss is not None and loss_config['freq_weight'] > 0:
-            freq = self.freq_loss(final_pred_x0, z_start)
-            loss_dict['freq'] = freq.item()
-            total_loss += loss_config['freq_weight'] * freq
+        # 频域损失和LPIPS感知损失（在图像空间计算）
+        need_image_space = (
+                (self.freq_loss is not None and loss_config['freq_weight'] > 0) or
+                (self.lpips_loss is not None and loss_config.get('lpips_weight', 0) > 0)
+        )
 
-        # LPIPS 感知损失
-        if self.lpips_loss is not None and loss_config.get('lpips_weight', 0) > 0:
-            lpips_val = self.lpips_loss(final_pred_x0, z_start)
-            loss_dict['lpips'] = lpips_val.item()
-            total_loss += loss_config['lpips_weight'] * lpips_val
+        if need_image_space:
+            # 解码到图像空间（不需要梯度，VAE是冻结的）
+            with torch.no_grad():
+                pred_image = self.vae.decode(final_pred_x0)  # [-1, 1]
+                gt_image = self.vae.decode(z_start)  # [-1, 1]
+
+            # 频域损失（图像空间）
+            if self.freq_loss is not None and loss_config['freq_weight'] > 0:
+                freq = self.freq_loss(pred_image, gt_image)
+                loss_dict['freq'] = freq.item()
+                total_loss += loss_config['freq_weight'] * freq
+
+            # LPIPS 感知损失（图像空间）
+            if self.lpips_loss is not None and loss_config.get('lpips_weight', 0) > 0:
+                lpips_val = self.lpips_loss(pred_image, gt_image)
+                loss_dict['lpips'] = lpips_val.item()
+                total_loss += loss_config['lpips_weight'] * lpips_val
 
         loss_dict['total'] = total_loss.item()
 
@@ -892,17 +875,29 @@ class NoisePredictorTrainer:
         loss_dict['l2'] = l2.item()
         total_loss += loss_config['l2_weight'] * l2
 
-        # 频域损失
-        if self.freq_loss is not None and loss_config['freq_weight'] > 0:
-            freq = self.freq_loss(sr_latent, hr_latent)
-            loss_dict['freq'] = freq.item()
-            total_loss += loss_config['freq_weight'] * freq
+        # 频域损失和LPIPS感知损失（在图像空间计算）
+        need_image_space = (
+                (self.freq_loss is not None and loss_config['freq_weight'] > 0) or
+                (self.lpips_loss is not None and loss_config.get('lpips_weight', 0) > 0)
+        )
 
-        # LPIPS感知损失
-        if self.lpips_loss is not None and loss_config.get('lpips_weight', 0) > 0:
-            lpips_val = self.lpips_loss(sr_latent, hr_latent)
-            loss_dict['lpips'] = lpips_val.item()
-            total_loss += loss_config['lpips_weight'] * lpips_val
+        if need_image_space:
+            # 解码到图像空间（不需要梯度，VAE是冻结的）
+            with torch.no_grad():
+                sr_image = self.vae.decode(sr_latent)  # [-1, 1]
+                hr_image = self.vae.decode(hr_latent)  # [-1, 1]
+
+            # 频域损失（图像空间）
+            if self.freq_loss is not None and loss_config['freq_weight'] > 0:
+                freq = self.freq_loss(sr_image, hr_image)
+                loss_dict['freq'] = freq.item()
+                total_loss += loss_config['freq_weight'] * freq
+
+            # LPIPS感知损失（图像空间）
+            if self.lpips_loss is not None and loss_config.get('lpips_weight', 0) > 0:
+                lpips_val = self.lpips_loss(sr_image, hr_image)
+                loss_dict['lpips'] = lpips_val.item()
+                total_loss += loss_config['lpips_weight'] * lpips_val
 
         loss_dict['total'] = total_loss.item()
 
