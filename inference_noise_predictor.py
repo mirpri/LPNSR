@@ -963,7 +963,7 @@ def main():
 
     # 打印最终的噪声策略
     if inferencer.use_random_noise:
-        print(f"噪声策略: 初始化(x_T)使用噪声预测器 + 中间采样使用随机高斯噪声")
+        print(f"噪声策略: 初始化(x_T)使用随机高斯噪声 + 中间采样使用随机高斯噪声")
     else:
         print(f"噪声策略: 初始化(x_T)使用噪声预测器 + 中间采样使用噪声预测器")
 

@@ -799,6 +799,8 @@ class NoisePredictorTrainer:
                 # 计算基线损失
                 baseline_l2 = F.mse_loss(pred_x0_random, z_start).item()
                 current_l2 = F.mse_loss(final_pred_x0, z_start).item()
+                baseline_lpips=self.lpips_loss(self.vae.decode(pred_x0_random), self.vae.decode(z_start)).item()
+                current_lpips=self.lpips_loss(self.vae.decode(final_pred_x0), self.vae.decode(z_start)).item()
 
                 # 计算改进百分比
                 improvement = (baseline_l2 - current_l2) / baseline_l2 * 100
@@ -808,7 +810,8 @@ class NoisePredictorTrainer:
                 self.loss_history['random_noise_l2'].append(baseline_l2)
                 self.loss_history['predicted_noise_l2'].append(current_l2)
                 self.loss_history['improvement_percent'].append(improvement)
-
+                print(f"[多步对比 Epoch {self.current_epoch}] 随机噪声LPIPS: {baseline_lpips:.4f} | 预测噪声LPIPS: {current_lpips:.4f}"
+                      )
                 print(
                     f"[多步对比 Epoch {self.current_epoch}] 随机噪声L2: {baseline_l2:.4f} | 预测噪声L2: {current_l2:.4f}")
                 if current_l2 < baseline_l2:
