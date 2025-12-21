@@ -388,8 +388,8 @@ if __name__ == "__main__":
     # 创建模型
     model = create_noise_predictor(
         latent_channels=3,
-        model_channels=192,
-        channel_mult=(1, 2, 4,8),
+        model_channels=128,
+        channel_mult=(1, 2, 4, 8),
         num_res_blocks=2,
         growth_rate=32,
         res_scale=0.1
