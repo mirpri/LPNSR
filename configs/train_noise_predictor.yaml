@@ -13,8 +13,7 @@ experiment:
   name: "noise_predictor"
   save_dir: "SR/experiments/noise_predictor"
   keep_recent_checkpoints: 5  # 保留最近N个checkpoint
-  log_interval: 1000
-  # 每N步打印一次日志
+  log_interval: 1000  # 每N步打印一次日志
   save_interval: 1  # 每N个epoch保存一次checkpoint
   val_interval: 1  # 每N个epoch验证一次
 
@@ -24,13 +23,13 @@ experiment:
 resshift:
   # VAE配置文件路径
   vae_config_path: "SR/configs/vqvae_config.yaml"
-  
+
   # VAE模型路径（冻结）
   vae_path: "SR/pretrained/autoencoder_vq_f4.pth"
-  
+
   # UNet配置文件路径
   unet_config_path: "SR/configs/unet_config.yaml"
-  
+
   # ResShift UNet模型路径（冻结）
   unet_path: "SR/pretrained/resshift_realsrx4_s4_v3.pth"
 
@@ -57,33 +56,33 @@ training:
   diffusion:
     # 总扩散步数T（ResShift v3直接用4步训练！）
     num_timesteps: 4
-    
+
     # ========== ResShift v3参数 ==========
     # κ (kappa)：方差控制参数（ResShift v3使用2.0）
     # 控制扩散过程中噪声的方差尺度
     kappa: 2.0
-    
+
     # η调度类型（ResShift使用eta而非beta）
     # - exponential: 指数调度（ResShift默认）
     # - ldm: 从.mat文件加载（需要提供mat_path）
     eta_schedule: "exponential"
-    
+
     # η_1：最小噪声水平（ResShift v3使用0.2）
     # 控制扩散过程开始时向LR图像偏移的程度
     min_noise_level: 0.2
-    
+
     # η_T：最大噪声水平（论文中通常为0.99）
     # 控制扩散过程结束时向LR图像偏移的程度
     etas_end: 0.99
-    
+
     # 指数调度的幂次（ResShift v3使用0.3）
     # 控制η增长的速度，power越大增长越快
     eta_power: 0.3
-    
+
     # 输入归一化（重要！ResShift原项目使用）
     normalize_input: true
     latent_flag: true
-    
+
     # 说明：
     # ResShift的扩散过程与DDPM完全不同！
     # - 前向过程：q(x_t|x_0,y) = N(x_t; η_t·(y-x_0)+x_0, η_t·κ²·I)
@@ -94,16 +93,16 @@ training:
     #        α_t = η_t - η_{t-1}（增量）
     # - 初始化：x_T ~ N(y, κ²·η_T·I)
     #   采样公式：x_T = y + κ·√η_T·ε
-    # 
+    #
     # 关键创新：
     # 1. 残差偏移：扩散过程向LR图像y偏移，而非向纯噪声偏移
     # 2. 条件扩散：前向过程依赖于y（LR图像）
     # 3. 预测x_0：模型直接预测干净图像，而非噪声
-    
+
   # 采样设置
   sampling_steps: 4  # 反向采样步数S（与num_timesteps一致，ResShift v3用4步）
   # 注意：初始化从N(y, κ²·η_T·I)采样，κ在diffusion.kappa中设置
-  
+
   # 优化技巧
   use_amp: true  # 混合精度训练
   use_ema: true  # 指数移动平均
@@ -111,7 +110,7 @@ training:
   use_gradient_checkpointing: true  # 梯度检查点
   gradient_clip: 1.0  # 梯度裁剪
   gradient_accumulation_steps: 16  # 梯度累积步数
-  
+
   # 学习率预热
   warmup_epochs: 5
   warmup_lr: 1.0e-6
@@ -126,12 +125,12 @@ data:
     lr_dir: null  # LR图像目录（如果为null，则通过退化生成）
     crop_size: 256  # 裁剪大小（必须是256，与预训练ResShift模型匹配）
     scale: 4  # 超分倍数
-    
+
     # 数据增强
     use_flip: true
     use_rot: true
     use_color_jitter: false
-    
+
   # 验证数据
   val:
     hr_dir: null
@@ -153,14 +152,20 @@ loss:
   # L2损失（预测z0与真实z0的MSE）
   # 类似 InvSR，只监督 UNet 输出的 z_0，不直接监督噪声预测
   l2_weight: 1.0
-  
-  # 频域感知损失
-  freq_weight: 0.5
-  freq_alpha: 2.0  # FocalFrequencyLoss的alpha参数
-  
+
   # LPIPS感知损失
   lpips_weight: 2.0
   lpips_net_type: 'alex'  # 可选: 'alex', 'vgg', 'squeeze'
+
+  # GAN对抗损失
+  gan_weight: 0.2  # GAN损失权重（生成器）
+  gan_type: 'lsgan'  # GAN类型: 'vanilla', 'lsgan', 'wgan', 'wgan-gp', 'hinge'
+  disc_type: 'patch'  # 判别器类型: 'patch', 'unet'
+  disc_ndf: 64  # 判别器基础通道数
+  disc_n_layers: 3  # 判别器层数（仅PatchGAN）
+  disc_norm_type: 'spectral'  # 判别器归一化类型: 'batch', 'instance', 'spectral', 'none'
+  disc_lr: 1.0e-4  # 判别器学习率
+  disc_start_epoch: 0  # 判别器开始训练的epoch（可以让生成器先预热）
 
 # ============================================================================
 # 优化器设置
@@ -177,10 +182,10 @@ optimizer:
 # ============================================================================
 scheduler:
   type: "CosineAnnealing"  # CosineAnnealing 或 StepLR
-  
+
   # CosineAnnealing参数
   min_lr: 1.0e-5
-  
+
   # StepLR参数
   step_size: 50
   gamma: 0.5
@@ -197,10 +202,10 @@ validation:
 # 日志设置
 # ============================================================================
 logging:
-  
+
   # 打印设置
   print_freq: 1000  # 每N步打印一次
-  
+
   # 保存设置
   save_freq: 1000  # 每N步保存一次可视化结果
 

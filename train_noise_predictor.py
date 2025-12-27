@@ -35,7 +35,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
@@ -49,8 +49,8 @@ from SR.models.noise_predictor import create_noise_predictor
 from SR.models.unet import UNetModelSwin
 from SR.ldm.models.autoencoder import VQModelTorch
 from SR.losses.basic_loss import L2Loss
-from SR.losses.frequency_loss import FocalFrequencyLoss
 from SR.losses.lpips_loss import LPIPSLoss
+from SR.losses.gan_loss import GANLoss, create_discriminator
 from SR.datapipe.train_dataloader import create_train_dataloader
 
 
@@ -189,9 +189,12 @@ class NoisePredictorTrainer:
 
         # 初始化AMP
         if self.config['training']['use_amp']:
-            self.scaler = GradScaler()
+            self.scaler_g = GradScaler()  # 生成器专用scaler
+            if self.discriminator is not None:
+                self.scaler_d = GradScaler()  # 判别器专用scaler
         else:
-            self.scaler = None
+            self.scaler_g = None
+            self.scaler_d = None
 
         # 训练状态
         self.current_epoch = 0
@@ -459,16 +462,6 @@ class NoisePredictorTrainer:
         self.l2_loss = L2Loss()
         print(f"✓ L2损失 (权重: {loss_config['l2_weight']})")
 
-        # 频域损失
-        if loss_config['freq_weight'] > 0:
-            self.freq_loss = FocalFrequencyLoss(
-                loss_weight=1.0,
-                alpha=loss_config.get('freq_alpha', 1.0)
-            )
-            print(f"✓ 频域损失 (权重: {loss_config['freq_weight']})")
-        else:
-            self.freq_loss = None
-
         # LPIPS感知损失
         if loss_config.get('lpips_weight', 0) > 0:
             self.lpips_loss = LPIPSLoss(
@@ -478,6 +471,33 @@ class NoisePredictorTrainer:
             print(f"✓ LPIPS感知损失 (权重: {loss_config['lpips_weight']})")
         else:
             self.lpips_loss = None
+
+        # GAN损失
+        if loss_config.get('gan_weight', 0) > 0:
+            # 创建判别器
+            self.discriminator = create_discriminator(
+                disc_type=loss_config.get('disc_type', 'patch'),
+                input_nc=3,
+                ndf=loss_config.get('disc_ndf', 64),
+                n_layers=loss_config.get('disc_n_layers', 3),
+                norm_type=loss_config.get('disc_norm_type', 'spectral')
+            ).to(self.device)
+
+            # 创建GAN损失
+            self.gan_loss = GANLoss(
+                gan_type=loss_config.get('gan_type', 'lsgan'),
+                loss_weight=1.0
+            )
+
+            # 统计判别器参数量
+            disc_params = sum(p.numel() for p in self.discriminator.parameters())
+            print(f"✓ GAN损失 (权重: {loss_config['gan_weight']})")
+            print(f"  - 判别器类型: {loss_config.get('disc_type', 'patch')}")
+            print(f"  - GAN类型: {loss_config.get('gan_type', 'lsgan')}")
+            print(f"  - 判别器参数量: {disc_params / 1e6:.2f}M")
+        else:
+            self.discriminator = None
+            self.gan_loss = None
 
     def _init_optimizer(self):
         """初始化优化器和学习率调度器"""
@@ -528,6 +548,21 @@ class NoisePredictorTrainer:
 
         if self.scheduler:
             print(f"✓ 学习率调度器: {scheduler_config['type']}")
+
+        # 判别器优化器（如果启用GAN损失）
+        loss_config = self.config['loss']
+        if loss_config.get('gan_weight', 0) > 0 and self.discriminator is not None:
+            disc_lr = loss_config.get('disc_lr', 1.0e-4)
+            self.optimizer_d = torch.optim.AdamW(
+                self.discriminator.parameters(),
+                lr=disc_lr,
+                betas=(opt_config['beta1'], opt_config['beta2']),
+                weight_decay=opt_config['weight_decay']
+            )
+            print(f"✓ 判别器优化器: AdamW")
+            print(f"  - 学习率: {disc_lr}")
+        else:
+            self.optimizer_d = None
 
     def _init_dataloaders(self):
         """初始化数据加载器"""
@@ -841,10 +876,10 @@ class NoisePredictorTrainer:
         loss_dict['l2'] = l2.item()
         total_loss += loss_config['l2_weight'] * l2
 
-        # 频域损失和LPIPS感知损失（在图像空间计算）
+        # LPIPS感知损失和GAN损失（在图像空间计算）
         need_image_space = (
-                (self.freq_loss is not None and loss_config['freq_weight'] > 0) or
-                (self.lpips_loss is not None and loss_config.get('lpips_weight', 0) > 0)
+                (self.lpips_loss is not None and loss_config.get('lpips_weight', 0) > 0) or
+                (self.gan_loss is not None and loss_config.get('gan_weight', 0) > 0)
         )
 
         if need_image_space:
@@ -857,17 +892,26 @@ class NoisePredictorTrainer:
             with torch.no_grad():
                 gt_image = self.vae.decode(z_start)  # [-1, 1]
 
-            # 频域损失（图像空间）
-            if self.freq_loss is not None and loss_config['freq_weight'] > 0:
-                freq = self.freq_loss(pred_image, gt_image)
-                loss_dict['freq'] = freq.item()
-                total_loss += loss_config['freq_weight'] * freq
-
             # LPIPS 感知损失（图像空间）
             if self.lpips_loss is not None and loss_config.get('lpips_weight', 0) > 0:
                 lpips_val = self.lpips_loss(pred_image, gt_image)
                 loss_dict['lpips'] = lpips_val.item()
                 total_loss += loss_config['lpips_weight'] * lpips_val
+
+            # GAN 生成器损失（图像空间）
+            if self.gan_loss is not None and loss_config.get('gan_weight', 0) > 0:
+                # 检查是否达到判别器开始训练的epoch
+                disc_start_epoch = loss_config.get('disc_start_epoch', 0)
+                if self.current_epoch >= disc_start_epoch:
+                    # 计算生成器损失：让判别器认为生成图像是真的
+                    fake_pred = self.discriminator(pred_image)
+                    g_loss = self.gan_loss(fake_pred, target_is_real=True, is_disc=False)
+                    loss_dict['g_loss'] = g_loss.item()
+                    total_loss += loss_config['gan_weight'] * g_loss
+
+            # 保存解码后的图像供判别器训练使用
+            self._pred_image_for_disc = pred_image.detach()
+            self._gt_image_for_disc = gt_image
 
         loss_dict['total'] = total_loss.item()
 
@@ -875,7 +919,7 @@ class NoisePredictorTrainer:
 
     def compute_loss(self, sr_latent, hr_latent):
         """
-        计算损失
+        计算损失（验证时使用，不包含GAN损失）
 
         Args:
             sr_latent: SR图像的潜在表示
@@ -895,32 +939,17 @@ class NoisePredictorTrainer:
         loss_dict['l2'] = l2.item()
         total_loss += loss_config['l2_weight'] * l2
 
-        # 频域损失和LPIPS感知损失（在图像空间计算）
-        need_image_space = (
-                (self.freq_loss is not None and loss_config['freq_weight'] > 0) or
-                (self.lpips_loss is not None and loss_config.get('lpips_weight', 0) > 0)
-        )
-
-        if need_image_space:
+        # LPIPS感知损失（在图像空间计算）
+        if self.lpips_loss is not None and loss_config.get('lpips_weight', 0) > 0:
             # 解码到图像空间
-            # 注意：sr_image 需要保留梯度以便感知损失能够反向传播
-            sr_image = self.vae.decode(sr_latent)  # [-1, 1]，保留梯度
-
-            # hr_image 不需要梯度
             with torch.no_grad():
+                sr_image = self.vae.decode(sr_latent)  # [-1, 1]
                 hr_image = self.vae.decode(hr_latent)  # [-1, 1]
 
-            # 频域损失（图像空间）
-            if self.freq_loss is not None and loss_config['freq_weight'] > 0:
-                freq = self.freq_loss(sr_image, hr_image)
-                loss_dict['freq'] = freq.item()
-                total_loss += loss_config['freq_weight'] * freq
-
             # LPIPS感知损失（图像空间）
-            if self.lpips_loss is not None and loss_config.get('lpips_weight', 0) > 0:
-                lpips_val = self.lpips_loss(sr_image, hr_image)
-                loss_dict['lpips'] = lpips_val.item()
-                total_loss += loss_config['lpips_weight'] * lpips_val
+            lpips_val = self.lpips_loss(sr_image, hr_image)
+            loss_dict['lpips'] = lpips_val.item()
+            total_loss += loss_config['lpips_weight'] * lpips_val
 
         loss_dict['total'] = total_loss.item()
 
@@ -1074,6 +1103,7 @@ class NoisePredictorTrainer:
 
         # 获取梯度累积步数
         gradient_accumulation_steps = self.config['training'].get('gradient_accumulation_steps', 1)
+        loss_config = self.config['loss']
 
         # 1. 编码到潜在空间（冻结的VAE）
         with torch.no_grad():
@@ -1091,8 +1121,7 @@ class NoisePredictorTrainer:
             )
             z_y = self.vae.encode(lr_images_upsampled)
 
-        # 2. 计算多步训练损失（与推理流程一致）
-        # 多步训练不需要随机采样时间步，而是执行完整的多步采样流程
+        # 2. 计算生成器损失（噪声预测器 + 多步训练损失）
         if self.config['training']['use_amp']:
             with autocast():
                 loss, loss_dict = self.multi_step_training_loss(
@@ -1103,20 +1132,20 @@ class NoisePredictorTrainer:
             scaled_loss = loss / gradient_accumulation_steps
 
             # 反向传播（AMP）- 梯度会累积
-            self.scaler.scale(scaled_loss).backward()
+            self.scaler_g.scale(scaled_loss).backward()
 
             # 只在累积完成后执行optimizer.step()
             if is_update_step:
                 # 梯度裁剪
                 if self.config['training']['gradient_clip'] > 0:
-                    self.scaler.unscale_(self.optimizer)
+                    self.scaler_g.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         self.noise_predictor.parameters(),
                         self.config['training']['gradient_clip']
                     )
 
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                self.scaler_g.step(self.optimizer)
+                self.scaler_g.update()
                 self.optimizer.zero_grad()  # 更新后清零梯度
         else:
             loss, loss_dict = self.multi_step_training_loss(
@@ -1141,6 +1170,65 @@ class NoisePredictorTrainer:
                 self.optimizer.step()
                 self.optimizer.zero_grad()  # 更新后清零梯度
 
+        # 3. 训练判别器（每个step计算loss并累积梯度，只在is_update_step时更新参数）
+        if (self.discriminator is not None and
+                self.optimizer_d is not None and
+                loss_config.get('gan_weight', 0) > 0):
+
+            disc_start_epoch = loss_config.get('disc_start_epoch', 0)
+            if self.current_epoch >= disc_start_epoch:
+                # 获取生成器产生的图像（已在multi_step_training_loss中保存）
+                if hasattr(self, '_pred_image_for_disc') and hasattr(self, '_gt_image_for_disc'):
+                    fake_image = self._pred_image_for_disc
+                    real_image = self._gt_image_for_disc
+
+                    self.discriminator.train()
+
+                    # 每个step都计算判别器损失并累积梯度
+                    if self.config['training']['use_amp']:
+                        with autocast():
+                            # 判别真实图像
+                            real_pred = self.discriminator(real_image)
+                            d_loss_real = self.gan_loss(real_pred, target_is_real=True, is_disc=True)
+
+                            # 判别生成图像
+                            fake_pred = self.discriminator(fake_image)
+                            d_loss_fake = self.gan_loss(fake_pred, target_is_real=False, is_disc=True)
+
+                            d_loss = (d_loss_real + d_loss_fake) / 2
+
+                        # 梯度累积：loss除以累积步数
+                        scaled_d_loss = d_loss / gradient_accumulation_steps
+                        self.scaler_d.scale(scaled_d_loss).backward()
+                    else:
+                        # 判别真实图像
+                        real_pred = self.discriminator(real_image)
+                        d_loss_real = self.gan_loss(real_pred, target_is_real=True, is_disc=True)
+
+                        # 判别生成图像
+                        fake_pred = self.discriminator(fake_image)
+                        d_loss_fake = self.gan_loss(fake_pred, target_is_real=False, is_disc=True)
+
+                        d_loss = (d_loss_real + d_loss_fake) / 2
+
+                        # 梯度累积：loss除以累积步数
+                        scaled_d_loss = d_loss / gradient_accumulation_steps
+                        scaled_d_loss.backward()
+
+                    # 记录损失（每个step都记录）
+                    loss_dict['d_loss'] = d_loss.item()
+                    loss_dict['d_loss_real'] = d_loss_real.item()
+                    loss_dict['d_loss_fake'] = d_loss_fake.item()
+
+                    # 只在累积完成后更新判别器参数
+                    if is_update_step:
+                        if self.config['training']['use_amp']:
+                            self.scaler_d.step(self.optimizer_d)
+                            self.scaler_d.update()  # 使用判别器专用的scaler更新
+                        else:
+                            self.optimizer_d.step()
+                        self.optimizer_d.zero_grad()  # 更新后清零梯度
+
         # 只在累积完成后更新EMA
         if is_update_step and self.ema is not None:
             self.ema.update()
@@ -1162,6 +1250,12 @@ class NoisePredictorTrainer:
 
         if self.ema is not None:
             checkpoint['ema'] = self.ema.shadow
+
+        # 保存判别器状态（如果启用GAN损失）
+        if self.discriminator is not None:
+            checkpoint['discriminator'] = self.discriminator.state_dict()
+        if self.optimizer_d is not None:
+            checkpoint['optimizer_d'] = self.optimizer_d.state_dict()
 
         # 保存最新的checkpoint（包含完整训练状态）
         ckpt_path = self.exp_dir / 'checkpoints' / f'checkpoint_epoch_{epoch}.pth'
@@ -1202,6 +1296,14 @@ class NoisePredictorTrainer:
 
         if self.ema is not None and 'ema' in checkpoint:
             self.ema.shadow = checkpoint['ema']
+
+        # 加载判别器状态（如果存在）
+        if self.discriminator is not None and 'discriminator' in checkpoint:
+            self.discriminator.load_state_dict(checkpoint['discriminator'])
+            print(f"  - 已加载判别器权重")
+        if self.optimizer_d is not None and 'optimizer_d' in checkpoint:
+            self.optimizer_d.load_state_dict(checkpoint['optimizer_d'])
+            print(f"  - 已加载判别器优化器状态")
 
         # 加载损失历史（如果存在）
         if 'loss_history' in checkpoint:
