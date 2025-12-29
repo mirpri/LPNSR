@@ -1,523 +1,696 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
-测试脚本：可视化噪声预测器的输出和初始化结果
+超分辨率模型测试脚本
 
-用于诊断噪声预测器的问题：
-1. 可视化预测的噪声分布
-2. 可视化 prior_sample 的初始化结果 x_T
-3. 可视化 VAE 解码后的图像
+功能：
+1. 加载LQ图像，使用训练好的模型生成SR图像
+2. 如果有GT图像，计算全参考指标（PSNR, SSIM, LPIPS）
+3. 计算无参考指标（NIQE, PI, CLIP-IQA, MUSIQ）
+4. 输出评估结果到CSV/JSON文件
 """
 
 import os
 import sys
-import torch
-import torch.nn.functional as F
-import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image
+import warnings
+
+# 过滤警告
+warnings.filterwarnings("ignore", message=".*A matching Triton is not available.*")
+warnings.filterwarnings("ignore", message=".*No module named 'triton'.*")
+
+import argparse
 import yaml
-import math
+import json
+import csv
+import torch
+import numpy as np
+import cv2
+import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+from pathlib import Path
+from tqdm import tqdm
+from datetime import datetime
+from collections import OrderedDict
 
 # 添加项目路径
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(str(Path(__file__).parent.parent))
 
-from SR.models.noise_predictor import EDSRUnetNoisePredictor
-
-
-def get_named_eta_schedule(
-        schedule_name,
-        num_diffusion_timesteps,
-        min_noise_level,
-        etas_end=0.99,
-        kappa=1.0,
-        **kwargs
-):
-    """获取ResShift的eta调度"""
-    if schedule_name == 'exponential':
-        power = kwargs.get('power', 2.0)
-        etas_start = min(min_noise_level / kappa, min_noise_level)
-        increaser = math.exp(1 / (num_diffusion_timesteps - 1) * math.log(etas_end / etas_start))
-        base = np.ones([num_diffusion_timesteps, ]) * increaser
-        power_timestep = np.linspace(0, 1, num_diffusion_timesteps, endpoint=True) ** power
-        power_timestep *= (num_diffusion_timesteps - 1)
-        sqrt_etas = np.power(base, power_timestep) * etas_start
-    else:
-        raise ValueError(f"未知的schedule_name: {schedule_name}")
-
-    return sqrt_etas
+# 导入推理器
+from SR.inference_noise_predictor import NoisePredictorInference
 
 
-class NoiseVisualizationTester:
-    """噪声预测器可视化测试器"""
-
-    def __init__(self, config_path: str, checkpoint_path: str, device: str = 'cuda'):
+class MetricsCalculator:
+    """
+    指标计算器
+    
+    支持以下指标：
+    - 全参考指标: PSNR, SSIM, LPIPS
+    - 无参考指标: NIQE, PI, CLIP-IQA, MUSIQ
+    """
+    
+    def __init__(self, config: dict, device: str = 'cuda'):
         """
+        初始化指标计算器
+        
         Args:
-            config_path: 配置文件路径
-            checkpoint_path: 噪声预测器权重路径
-            device: 设备
+            config: 指标配置
+            device: 计算设备
         """
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.config = config
+        self.device = device
+        self.use_pyiqa = config.get('use_pyiqa', True)
+        
+        # 指标参数
+        self.crop_border = config.get('crop_border', 4)
+        self.test_y_channel = config.get('test_y_channel', True)
+        self.lpips_net = config.get('lpips_net', 'alex')
+        
+        # 初始化指标计算器
+        self._init_metrics()
+    
+    def _init_metrics(self):
+        """初始化各种指标计算器"""
+        self.metrics_enabled = {}
+        self.metric_calculators = {}
+        
+        # 检查是否可以使用pyiqa库
+        self.pyiqa_available = False
+        if self.use_pyiqa:
+            try:
+                import pyiqa
+                self.pyiqa_available = True
+                print("✓ pyiqa库可用，将使用官方实现")
+            except ImportError:
+                print("⚠ pyiqa库不可用，将使用内置实现")
+                print("  建议安装: pip install pyiqa")
+        
+        # 初始化全参考指标
+        # PSNR
+        if self.config.get('calculate_psnr', True):
+            self.metrics_enabled['psnr'] = True
+            from SR.metrics.psnr import PSNR
+            self.metric_calculators['psnr'] = PSNR(
+                crop_border=self.crop_border,
+                test_y_channel=self.test_y_channel
+            )
+            print(f"  ✓ PSNR 初始化完成")
+        
+        # SSIM
+        if self.config.get('calculate_ssim', True):
+            self.metrics_enabled['ssim'] = True
+            from SR.metrics.ssim import SSIM
+            self.metric_calculators['ssim'] = SSIM(
+                crop_border=self.crop_border,
+                test_y_channel=self.test_y_channel
+            )
+            print(f"  ✓ SSIM 初始化完成")
+        
+        # LPIPS
+        if self.config.get('calculate_lpips', True):
+            self.metrics_enabled['lpips'] = True
+            if self.pyiqa_available:
+                import pyiqa
+                self.metric_calculators['lpips'] = pyiqa.create_metric(
+                    'lpips', device=self.device, net=self.lpips_net
+                )
+            else:
+                from SR.metrics.lpips import LPIPS
+                self.metric_calculators['lpips'] = LPIPS(
+                    net=self.lpips_net,
+                    use_gpu=(self.device == 'cuda')
+                )
+            print(f"  ✓ LPIPS 初始化完成 (net={self.lpips_net})")
+        
+        # 初始化无参考指标
+        # NIQE
+        if self.config.get('calculate_niqe', True):
+            self.metrics_enabled['niqe'] = True
+            if self.pyiqa_available:
+                import pyiqa
+                self.metric_calculators['niqe'] = pyiqa.create_metric('niqe', device=self.device)
+            else:
+                from SR.metrics.niqe import NIQE
+                self.metric_calculators['niqe'] = NIQE(device=self.device)
+            print(f"  ✓ NIQE 初始化完成")
+        
+        # PI
+        if self.config.get('calculate_pi', True):
+            self.metrics_enabled['pi'] = True
+            if self.pyiqa_available:
+                try:
+                    import pyiqa
+                    self.metric_calculators['pi'] = pyiqa.create_metric('pi', device=self.device)
+                except Exception as e:
+                    print(f"  ⚠ PI (pyiqa) 初始化失败: {e}，使用内置实现")
+                    from SR.metrics.pi import PI
+                    self.metric_calculators['pi'] = PI(device=self.device)
+            else:
+                from SR.metrics.pi import PI
+                self.metric_calculators['pi'] = PI(device=self.device)
+            print(f"  ✓ PI 初始化完成")
+        
+        # CLIP-IQA
+        if self.config.get('calculate_clipiqa', True):
+            self.metrics_enabled['clipiqa'] = True
+            if self.pyiqa_available:
+                try:
+                    import pyiqa
+                    self.metric_calculators['clipiqa'] = pyiqa.create_metric('clipiqa', device=self.device)
+                except Exception as e:
+                    print(f"  ⚠ CLIP-IQA (pyiqa) 初始化失败: {e}")
+                    self.metrics_enabled['clipiqa'] = False
+            else:
+                from SR.metrics.clipiqa import CLIPIQA
+                self.metric_calculators['clipiqa'] = CLIPIQA(device=self.device)
+            if self.metrics_enabled['clipiqa']:
+                print(f"  ✓ CLIP-IQA 初始化完成")
+        
+        # MUSIQ
+        if self.config.get('calculate_musiq', True):
+            self.metrics_enabled['musiq'] = True
+            if self.pyiqa_available:
+                try:
+                    import pyiqa
+                    self.metric_calculators['musiq'] = pyiqa.create_metric('musiq', device=self.device)
+                except Exception as e:
+                    print(f"  ⚠ MUSIQ (pyiqa) 初始化失败: {e}")
+                    self.metrics_enabled['musiq'] = False
+            else:
+                from SR.metrics.musiq import MUSIQ
+                self.metric_calculators['musiq'] = MUSIQ(device=self.device)
+            if self.metrics_enabled['musiq']:
+                print(f"  ✓ MUSIQ 初始化完成")
+    
+    def _to_tensor(self, img: np.ndarray) -> torch.Tensor:
+        """
+        将numpy图像转换为PyTorch张量
+        
+        Args:
+            img: numpy图像 (H, W, C), [0, 255], BGR
+            
+        Returns:
+            张量 (1, C, H, W), [0, 1], RGB
+        """
+        # BGR -> RGB
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        # HWC -> CHW
+        img_chw = img_rgb.transpose(2, 0, 1)
+        # 归一化到[0, 1]
+        img_tensor = torch.from_numpy(img_chw).float() / 255.0
+        # 添加batch维度
+        img_tensor = img_tensor.unsqueeze(0).to(self.device)
+        return img_tensor
+    
+    def calculate_fr_metrics(
+        self,
+        sr_img: np.ndarray,
+        gt_img: np.ndarray
+    ) -> dict:
+        """
+        计算全参考指标
+        
+        Args:
+            sr_img: SR图像 (H, W, C), [0, 255], BGR
+            gt_img: GT图像 (H, W, C), [0, 255], BGR
+            
+        Returns:
+            指标字典
+        """
+        results = {}
+        
+        # PSNR
+        if self.metrics_enabled.get('psnr', False):
+            psnr_val = self.metric_calculators['psnr'](sr_img, gt_img)
+            results['psnr'] = psnr_val
+        
+        # SSIM
+        if self.metrics_enabled.get('ssim', False):
+            ssim_val = self.metric_calculators['ssim'](sr_img, gt_img)
+            results['ssim'] = ssim_val
+        
+        # LPIPS
+        if self.metrics_enabled.get('lpips', False):
+            sr_tensor = self._to_tensor(sr_img)
+            gt_tensor = self._to_tensor(gt_img)
+            
+            with torch.no_grad():
+                if self.pyiqa_available:
+                    lpips_val = self.metric_calculators['lpips'](sr_tensor, gt_tensor).item()
+                else:
+                    lpips_val = self.metric_calculators['lpips'](sr_tensor, gt_tensor)
+            results['lpips'] = lpips_val
+        
+        return results
+    
+    def calculate_nr_metrics(self, sr_img: np.ndarray) -> dict:
+        """
+        计算无参考指标
+        
+        Args:
+            sr_img: SR图像 (H, W, C), [0, 255], BGR
+            
+        Returns:
+            指标字典
+        """
+        results = {}
+        sr_tensor = self._to_tensor(sr_img)
+        
+        # NIQE
+        if self.metrics_enabled.get('niqe', False):
+            with torch.no_grad():
+                if self.pyiqa_available and hasattr(self.metric_calculators['niqe'], '__call__'):
+                    niqe_val = self.metric_calculators['niqe'](sr_tensor).item()
+                else:
+                    niqe_val = self.metric_calculators['niqe'](sr_img)
+            results['niqe'] = niqe_val
+        
+        # PI
+        if self.metrics_enabled.get('pi', False):
+            with torch.no_grad():
+                try:
+                    if self.pyiqa_available and hasattr(self.metric_calculators['pi'], '__call__'):
+                        pi_val = self.metric_calculators['pi'](sr_tensor).item()
+                    else:
+                        pi_val = self.metric_calculators['pi'](sr_img)
+                    results['pi'] = pi_val
+                except Exception as e:
+                    print(f"  ⚠ PI计算失败: {e}")
+                    results['pi'] = float('nan')
+        
+        # CLIP-IQA
+        if self.metrics_enabled.get('clipiqa', False):
+            with torch.no_grad():
+                try:
+                    if self.pyiqa_available:
+                        clipiqa_val = self.metric_calculators['clipiqa'](sr_tensor).item()
+                    else:
+                        clipiqa_val = self.metric_calculators['clipiqa'](sr_img)
+                    results['clipiqa'] = clipiqa_val
+                except Exception as e:
+                    print(f"  ⚠ CLIP-IQA计算失败: {e}")
+                    results['clipiqa'] = float('nan')
+        
+        # MUSIQ
+        if self.metrics_enabled.get('musiq', False):
+            with torch.no_grad():
+                try:
+                    if self.pyiqa_available:
+                        musiq_val = self.metric_calculators['musiq'](sr_tensor).item()
+                    else:
+                        musiq_val = self.metric_calculators['musiq'](sr_img)
+                    results['musiq'] = musiq_val
+                except Exception as e:
+                    print(f"  ⚠ MUSIQ计算失败: {e}")
+                    results['musiq'] = float('nan')
+        
+        return results
+    
+    def calculate_all(
+        self,
+        sr_img: np.ndarray,
+        gt_img: np.ndarray = None
+    ) -> dict:
+        """
+        计算所有指标
+        
+        Args:
+            sr_img: SR图像
+            gt_img: GT图像（可选，如果没有则只计算无参考指标）
+            
+        Returns:
+            所有指标的字典
+        """
+        results = {}
+        
+        # 计算全参考指标
+        if gt_img is not None:
+            fr_results = self.calculate_fr_metrics(sr_img, gt_img)
+            results.update(fr_results)
+        
+        # 计算无参考指标
+        nr_results = self.calculate_nr_metrics(sr_img)
+        results.update(nr_results)
+        
+        return results
 
+
+class SRTester:
+    """
+    超分辨率测试器
+    
+    功能：
+    1. 加载LQ图像并生成SR图像
+    2. 计算各种评估指标
+    3. 保存结果
+    """
+    
+    def __init__(self, config_path: str):
+        """
+        初始化测试器
+        
+        Args:
+            config_path: 测试配置文件路径
+        """
         # 加载配置
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
-
-        # 初始化扩散参数
-        self._init_diffusion()
-
-        # 加载模型
-        self._load_models(checkpoint_path)
-
-        print(f"[INFO] 测试器初始化完成，设备: {self.device}")
-        print(f"[INFO] 扩散参数: num_timesteps={self.num_timesteps}, kappa={self.kappa}")
-        print(f"[INFO] sqrt_etas: {self.sqrt_etas.numpy()}")
-
-    def _init_diffusion(self):
-        """初始化扩散参数"""
-        diffusion_config = self.config['diffusion']
-
-        self.num_timesteps = diffusion_config['num_timesteps']
-        self.kappa = diffusion_config['kappa']
-
-        # 计算eta调度
-        sqrt_etas = get_named_eta_schedule(
-            schedule_name=diffusion_config['eta_schedule'],
-            num_diffusion_timesteps=self.num_timesteps,
-            min_noise_level=diffusion_config['min_noise_level'],
-            etas_end=diffusion_config['etas_end'],
-            kappa=self.kappa,
-            power=diffusion_config['eta_power']
+        
+        # 设置随机种子
+        seed = self.config.get('seed', 12345)
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        
+        # 设备
+        self.device = self.config.get('device', 'cuda')
+        if self.device == 'cuda' and not torch.cuda.is_available():
+            print("⚠ CUDA不可用，使用CPU")
+            self.device = 'cpu'
+        
+        # 数据路径
+        self.gt_folder = self.config['data'].get('gt_folder', '')
+        self.lq_folder = self.config['data']['lq_folder']
+        self.output_folder = Path(self.config['data'].get('output_folder', './test_results'))
+        
+        # 检查是否有GT图像
+        self.has_gt = bool(self.gt_folder) and Path(self.gt_folder).exists()
+        
+        # 输出配置
+        self.output_config = self.config.get('output', {})
+        self.save_sr_images = self.output_config.get('save_sr_images', True)
+        self.save_metrics_csv = self.output_config.get('save_metrics_csv', True)
+        self.save_metrics_json = self.output_config.get('save_metrics_json', True)
+        self.print_per_image = self.output_config.get('print_per_image', True)
+        
+        # 初始化推理器
+        print("\n" + "=" * 60)
+        print("初始化推理器...")
+        print("=" * 60)
+        inference_config = self.config['inference']['config_path']
+        self.inferencer = NoisePredictorInference(inference_config, device=self.device)
+        
+        # 初始化指标计算器
+        print("\n" + "=" * 60)
+        print("初始化指标计算器...")
+        print("=" * 60)
+        self.metrics_calculator = MetricsCalculator(
+            self.config['metrics'],
+            device=self.device
         )
-
-        self.sqrt_etas = torch.from_numpy(sqrt_etas.astype(np.float32))
-        self.etas = self.sqrt_etas ** 2
-
-    def _load_models(self, checkpoint_path: str):
-        """加载模型"""
-        # 加载VAE
-        from SR.ldm.models.autoencoder import VQModelTorch
-        vae_path = self.config['model']['vae_path']
-
-        # VAE模型结构参数（必须与预训练权重一致）
-        ddconfig = {
-            'double_z': False,
-            'z_channels': 3,
-            'resolution': 256,
-            'in_channels': 3,
-            'out_ch': 3,
-            'ch': 128,
-            'ch_mult': [1, 2, 4],
-            'num_res_blocks': 2,
-            'attn_resolutions': [],
-            'dropout': 0.0,
-            'padding_mode': 'zeros',
-        }
-
-        self.vae = VQModelTorch(
-            ddconfig=ddconfig,
-            n_embed=8192,
-            embed_dim=3,
-            rank=8,
-            lora_alpha=1.0,
-            lora_tune_decoder=False,
-        )
-
-        # 加载预训练权重
-        vae_ckpt = torch.load(vae_path, map_location='cpu')
-        if 'state_dict' in vae_ckpt:
-            state_dict = vae_ckpt['state_dict']
-        else:
-            state_dict = vae_ckpt
-
-        # 去除前缀
-        new_state_dict = {}
-        for key, value in state_dict.items():
-            new_key = key
-            if key.startswith('module._orig_mod.'):
-                new_key = key.replace('module._orig_mod.', '')
-            elif key.startswith('module.'):
-                new_key = key.replace('module.', '')
-            new_state_dict[new_key] = value
-
-        self.vae.load_state_dict(new_state_dict, strict=False)
-        self.vae.to(self.device)
-        self.vae.eval()
-        print(f"[INFO] VAE加载完成: {vae_path}")
-
-        # 加载噪声预测器
-        np_config = self.config['noise_predictor']
-        self.noise_predictor = EDSRUnetNoisePredictor(
-            latent_channels=np_config['latent_channels'],
-            model_channels=np_config['model_channels'],
-            channel_mult=np_config['channel_mult'],
-            num_res_blocks=np_config['num_res_blocks'],
-            attention_levels=np_config['attention_levels'],
-            num_heads=np_config['num_heads'],
-            use_cross_attention=np_config['use_cross_attention'],
-            use_frequency_aware=np_config['use_frequency_aware'],
-            use_xformers=np_config.get('use_xformers', True),
-            double_z=True  # 输出分布
-        )
-
-        # 加载权重
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        if 'noise_predictor_state_dict' in checkpoint:
-            self.noise_predictor.load_state_dict(checkpoint['noise_predictor_state_dict'])
-        elif 'model_state_dict' in checkpoint:
-            self.noise_predictor.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            self.noise_predictor.load_state_dict(checkpoint)
-
-        self.noise_predictor.to(self.device)
-        self.noise_predictor.eval()
-        print(f"[INFO] 噪声预测器加载完成: {checkpoint_path}")
-
-    def load_image(self, image_path: str, target_size: int = 256) -> torch.Tensor:
-        """加载并预处理图像"""
-        img = Image.open(image_path).convert('RGB')
-
-        # Resize
-        img = img.resize((target_size, target_size), Image.LANCZOS)
-
-        # 转换为tensor [0, 1] -> [-1, 1]
-        img_np = np.array(img).astype(np.float32) / 255.0
-        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
-        img_tensor = img_tensor * 2 - 1  # [-1, 1]
-
-        return img_tensor.to(self.device)
-
-    def encode_image(self, img: torch.Tensor) -> torch.Tensor:
-        """使用VAE编码图像到潜在空间"""
-        with torch.no_grad():
-            z = self.vae.encode(img)
-        return z
-
-    def decode_latent(self, z: torch.Tensor) -> torch.Tensor:
-        """使用VAE解码潜在表示到图像"""
-        with torch.no_grad():
-            img = self.vae.decode(z)
-        return img
-
-    def prior_sample(self, z_y: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        
+        print("\n" + "=" * 60)
+        print("测试器初始化完成")
+        print("=" * 60)
+        print(f"  - LQ文件夹: {self.lq_folder}")
+        print(f"  - GT文件夹: {self.gt_folder if self.has_gt else '无（只计算无参考指标）'}")
+        print(f"  - 输出文件夹: {self.output_folder}")
+        print(f"  - 设备: {self.device}")
+    
+    def _get_image_pairs(self) -> list:
         """
-        计算 prior_sample 初始化
-
-        公式: x_T = y + κ · √η_T · noise
-
-        Args:
-            z_y: LR图像的潜在表示 [B, C, H, W]
-            noise: 预测的噪声 [B, C, H, W]
-
+        获取图像对列表
+        
         Returns:
-            x_T: 初始化的潜在表示 [B, C, H, W]
+            [(lq_path, gt_path), ...] 列表，gt_path可能为None
         """
-        t = self.num_timesteps - 1  # 最后一个时间步
-        coef = self.kappa * self.sqrt_etas[t].item()
-        x_T = z_y + coef * noise
-        return x_T
-
-    @torch.no_grad()
-    def test_noise_prediction(self, image_path: str, save_dir: str = 'test_outputs'):
+        lq_folder = Path(self.lq_folder)
+        
+        # 支持的图像格式
+        extensions = ['*.png', '*.jpg', '*.jpeg', '*.bmp', '*.PNG', '*.JPG', '*.JPEG', '*.BMP']
+        
+        # 获取LQ图像
+        lq_paths = []
+        for ext in extensions:
+            lq_paths.extend(lq_folder.glob(ext))
+        lq_paths = sorted(lq_paths)
+        
+        if len(lq_paths) == 0:
+            raise ValueError(f"在 {lq_folder} 中未找到图像文件")
+        
+        # 匹配GT图像
+        pairs = []
+        if self.has_gt:
+            gt_folder = Path(self.gt_folder)
+            for lq_path in lq_paths:
+                # 尝试不同的匹配方式
+                gt_path = None
+                
+                # 1. 完全相同的文件名
+                candidate = gt_folder / lq_path.name
+                if candidate.exists():
+                    gt_path = candidate
+                else:
+                    # 2. 去除后缀如 _lq, _lr, x4 等
+                    stem = lq_path.stem
+                    for suffix in ['_lq', '_lr', '_LQ', '_LR', 'x4', 'x2', '_bicubic','_LR4']:
+                        if stem.endswith(suffix):
+                            stem = stem[:-len(suffix)]
+                            break
+                    
+                    # 尝试不同扩展名
+                    for ext in ['.png', '.jpg', '.jpeg', '.bmp']:
+                        candidate = gt_folder / (stem + ext)
+                        if candidate.exists():
+                            gt_path = candidate
+                            break
+                        # 尝试加上 _gt, _hr 后缀
+                        for gt_suffix in ['_gt', '_hr', '_GT', '_HR']:
+                            candidate = gt_folder / (stem + gt_suffix + ext)
+                            if candidate.exists():
+                                gt_path = candidate
+                                break
+                
+                pairs.append((lq_path, gt_path))
+        else:
+            pairs = [(lq_path, None) for lq_path in lq_paths]
+        
+        return pairs
+    
+    def _process_single_image(self, lq_path: Path) -> np.ndarray:
         """
-        测试噪声预测并可视化结果
-
+        处理单张图像
+        
         Args:
-            image_path: 输入图像路径
-            save_dir: 输出保存目录
+            lq_path: LQ图像路径
+            
+        Returns:
+            SR图像 (H, W, C), [0, 255], BGR
         """
-        os.makedirs(save_dir, exist_ok=True)
-
-        # 1. 加载并编码图像
-        print("\n[Step 1] 加载并编码图像...")
-        img = self.load_image(image_path)
-        z_y = self.encode_image(img)
-
-        print(f"  输入图像形状: {img.shape}")
-        print(f"  潜在表示 z_y 形状: {z_y.shape}")
-        print(f"  z_y 统计: min={z_y.min():.4f}, max={z_y.max():.4f}, mean={z_y.mean():.4f}, std={z_y.std():.4f}")
-
-        # 2. 使用噪声预测器生成噪声
-        print("\n[Step 2] 噪声预测器生成噪声...")
-        t = torch.tensor([self.num_timesteps - 1], device=self.device).long()
-
-        # 初始化时使用随机高斯噪声（不使用噪声预测器）
-        predicted_noise = torch.randn_like(z_y)
-
-        print(f"  预测噪声形状: {predicted_noise.shape}")
-        print(f"  预测噪声统计: min={predicted_noise.min():.4f}, max={predicted_noise.max():.4f}, "
-              f"mean={predicted_noise.mean():.4f}, std={predicted_noise.std():.4f}")
-
-        # 3. 生成随机高斯噪声作为对比
-        print("\n[Step 3] 生成随机高斯噪声作为对比...")
-        random_noise = torch.randn_like(z_y)
-        print(f"  随机噪声统计: min={random_noise.min():.4f}, max={random_noise.max():.4f}, "
-              f"mean={random_noise.mean():.4f}, std={random_noise.std():.4f}")
-
-        # 4. 计算 prior_sample 初始化
-        print("\n[Step 4] 计算 prior_sample 初始化...")
-        coef = self.kappa * self.sqrt_etas[-1].item()
-        print(f"  κ = {self.kappa}, √η_T = {self.sqrt_etas[-1].item():.4f}, κ·√η_T = {coef:.4f}")
-
-        x_T_predicted = self.prior_sample(z_y, predicted_noise)
-        x_T_random = self.prior_sample(z_y, random_noise)
-
-        print(f"  x_T (预测噪声) 统计: min={x_T_predicted.min():.4f}, max={x_T_predicted.max():.4f}, "
-              f"mean={x_T_predicted.mean():.4f}, std={x_T_predicted.std():.4f}")
-        print(f"  x_T (随机噪声) 统计: min={x_T_random.min():.4f}, max={x_T_random.max():.4f}, "
-              f"mean={x_T_random.mean():.4f}, std={x_T_random.std():.4f}")
-
-        # 5. VAE解码
-        print("\n[Step 5] VAE解码...")
-        decoded_z_y = self.decode_latent(z_y)
-        decoded_x_T_predicted = self.decode_latent(x_T_predicted)
-        decoded_x_T_random = self.decode_latent(x_T_random)
-
-        # 6. 可视化
-        print("\n[Step 6] 生成可视化...")
-        self._visualize_results(
-            img=img,
-            z_y=z_y,
-            predicted_noise=predicted_noise,
-            random_noise=random_noise,
-            x_T_predicted=x_T_predicted,
-            x_T_random=x_T_random,
-            decoded_z_y=decoded_z_y,
-            decoded_x_T_predicted=decoded_x_T_predicted,
-            decoded_x_T_random=decoded_x_T_random,
-            save_dir=save_dir
-        )
-
-        print(f"\n[完成] 结果已保存到 {save_dir}/")
-
-    def _visualize_results(self, img, z_y, predicted_noise, random_noise,
-                           x_T_predicted, x_T_random, decoded_z_y,
-                           decoded_x_T_predicted, decoded_x_T_random, save_dir):
-        """可视化所有结果"""
-
-        def tensor_to_image(t):
-            """将tensor转换为可显示的numpy图像"""
-            t = t.squeeze(0).cpu()
-            if t.shape[0] == 3:  # RGB图像
-                t = (t + 1) / 2  # [-1, 1] -> [0, 1]
-                t = t.clamp(0, 1)
-                return t.permute(1, 2, 0).numpy()
-            else:
-                return t.numpy()
-
-        def latent_to_vis(z):
-            """将潜在空间tensor可视化"""
-            z = z.squeeze(0).cpu()
-            # 取前3个通道或全部通道的均值
-            if z.shape[0] >= 3:
-                z_vis = z[:3]  # 取前3通道
-            else:
-                z_vis = z.mean(dim=0, keepdim=True).expand(3, -1, -1)
-            # 归一化到 [0, 1]
-            z_min, z_max = z_vis.min(), z_vis.max()
-            z_vis = (z_vis - z_min) / (z_max - z_min + 1e-8)
-            return z_vis.permute(1, 2, 0).numpy()
-
-        # 创建大图
-        fig, axes = plt.subplots(3, 4, figsize=(20, 15))
-
-        # 第一行：输入和潜在表示
-        axes[0, 0].imshow(tensor_to_image(img))
-        axes[0, 0].set_title('Input Image')
-        axes[0, 0].axis('off')
-
-        axes[0, 1].imshow(latent_to_vis(z_y))
-        axes[0, 1].set_title(f'z_y (VAE latent)\nmin={z_y.min():.2f}, max={z_y.max():.2f}')
-        axes[0, 1].axis('off')
-
-        axes[0, 2].imshow(tensor_to_image(decoded_z_y))
-        axes[0, 2].set_title('Decoded z_y')
-        axes[0, 2].axis('off')
-
-        # 噪声直方图
-        axes[0, 3].hist(predicted_noise.cpu().flatten().numpy(), bins=100, alpha=0.7, label='Predicted', density=True)
-        axes[0, 3].hist(random_noise.cpu().flatten().numpy(), bins=100, alpha=0.7, label='Random N(0,1)', density=True)
-        axes[0, 3].axvline(x=-3, color='r', linestyle='--', alpha=0.5)
-        axes[0, 3].axvline(x=3, color='r', linestyle='--', alpha=0.5)
-        axes[0, 3].set_title('Noise Distribution')
-        axes[0, 3].legend()
-        axes[0, 3].set_xlim(-15, 15)
-
-        # 第二行：预测噪声 vs 随机噪声
-        axes[1, 0].imshow(latent_to_vis(predicted_noise))
-        axes[1, 0].set_title(f'Predicted Noise\nmin={predicted_noise.min():.2f}, max={predicted_noise.max():.2f}')
-        axes[1, 0].axis('off')
-
-        axes[1, 1].imshow(latent_to_vis(random_noise))
-        axes[1, 1].set_title(f'Random Noise\nmin={random_noise.min():.2f}, max={random_noise.max():.2f}')
-        axes[1, 1].axis('off')
-
-        # 噪声差异
-        noise_diff = (predicted_noise - random_noise).abs()
-        axes[1, 2].imshow(latent_to_vis(noise_diff))
-        axes[1, 2].set_title(f'|Predicted - Random|\nmean={noise_diff.mean():.2f}')
-        axes[1, 2].axis('off')
-
-        # 预测噪声各通道直方图
-        pred_np = predicted_noise.squeeze(0).cpu().numpy()
-        for c in range(min(3, pred_np.shape[0])):
-            axes[1, 3].hist(pred_np[c].flatten(), bins=50, alpha=0.5, label=f'Ch{c}', density=True)
-        axes[1, 3].set_title('Predicted Noise by Channel')
-        axes[1, 3].legend()
-
-        # 第三行：x_T 初始化结果
-        coef = self.kappa * self.sqrt_etas[-1].item()
-
-        axes[2, 0].imshow(latent_to_vis(x_T_predicted))
-        axes[2, 0].set_title(f'x_T (Predicted)\nmin={x_T_predicted.min():.2f}, max={x_T_predicted.max():.2f}')
-        axes[2, 0].axis('off')
-
-        axes[2, 1].imshow(latent_to_vis(x_T_random))
-        axes[2, 1].set_title(f'x_T (Random)\nmin={x_T_random.min():.2f}, max={x_T_random.max():.2f}')
-        axes[2, 1].axis('off')
-
-        axes[2, 2].imshow(tensor_to_image(decoded_x_T_predicted))
-        axes[2, 2].set_title(f'Decoded x_T (Predicted)\nκ·√η_T={coef:.3f}')
-        axes[2, 2].axis('off')
-
-        axes[2, 3].imshow(tensor_to_image(decoded_x_T_random))
-        axes[2, 3].set_title('Decoded x_T (Random)')
-        axes[2, 3].axis('off')
-
-        plt.suptitle('Noise Predictor Visualization\n'
-                     f'Formula: x_T = z_y + κ·√η_T·noise, where κ={self.kappa}, √η_T={self.sqrt_etas[-1]:.4f}',
-                     fontsize=14)
-        plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, 'noise_visualization.png'), dpi=150, bbox_inches='tight')
-        plt.close()
-
-        # 保存单独的统计信息
-        stats = {
-            'z_y': {
-                'min': z_y.min().item(),
-                'max': z_y.max().item(),
-                'mean': z_y.mean().item(),
-                'std': z_y.std().item()
-            },
-            'predicted_noise': {
-                'min': predicted_noise.min().item(),
-                'max': predicted_noise.max().item(),
-                'mean': predicted_noise.mean().item(),
-                'std': predicted_noise.std().item()
-            },
-            'random_noise': {
-                'min': random_noise.min().item(),
-                'max': random_noise.max().item(),
-                'mean': random_noise.mean().item(),
-                'std': random_noise.std().item()
-            },
-            'x_T_predicted': {
-                'min': x_T_predicted.min().item(),
-                'max': x_T_predicted.max().item(),
-                'mean': x_T_predicted.mean().item(),
-                'std': x_T_predicted.std().item()
-            },
-            'x_T_random': {
-                'min': x_T_random.min().item(),
-                'max': x_T_random.max().item(),
-                'mean': x_T_random.mean().item(),
-                'std': x_T_random.std().item()
-            },
-            'diffusion_params': {
-                'kappa': self.kappa,
-                'sqrt_eta_T': self.sqrt_etas[-1].item(),
-                'coef': coef
+        # 读取LQ图像
+        lq_img = cv2.imread(str(lq_path))
+        lq_img_rgb = cv2.cvtColor(lq_img, cv2.COLOR_BGR2RGB)
+        lq_img_float = lq_img_rgb.astype(np.float32) / 255.0
+        
+        # 超分辨率处理
+        sr_img_float = self.inferencer.process_single_image(lq_img_float)
+        
+        # 转换为uint8 BGR
+        sr_img = (sr_img_float * 255.0).clip(0, 255).astype(np.uint8)
+        sr_img_bgr = cv2.cvtColor(sr_img, cv2.COLOR_RGB2BGR)
+        
+        return sr_img_bgr
+    
+    def run(self):
+        """
+        运行测试
+        """
+        print("\n" + "=" * 60)
+        print("开始测试")
+        print("=" * 60)
+        
+        # 创建输出目录
+        self.output_folder.mkdir(parents=True, exist_ok=True)
+        sr_output_folder = self.output_folder / 'sr_images'
+        if self.save_sr_images:
+            sr_output_folder.mkdir(parents=True, exist_ok=True)
+        
+        # 获取图像对
+        pairs = self._get_image_pairs()
+        print(f"\n找到 {len(pairs)} 张图像")
+        
+        if self.has_gt:
+            gt_count = sum(1 for _, gt in pairs if gt is not None)
+            print(f"  - 匹配到GT图像: {gt_count} 张")
+        
+        # 存储所有结果
+        all_results = []
+        
+        # 处理每张图像
+        for lq_path, gt_path in tqdm(pairs, desc="测试进度"):
+            result = OrderedDict()
+            result['image_name'] = lq_path.name
+            
+            # 生成SR图像
+            sr_img = self._process_single_image(lq_path)
+            
+            # 保存SR图像
+            if self.save_sr_images:
+                sr_save_path = sr_output_folder / f"{lq_path.stem}_sr.png"
+                cv2.imwrite(str(sr_save_path), sr_img)
+            
+            # 加载GT图像
+            gt_img = None
+            if gt_path is not None and gt_path.exists():
+                gt_img = cv2.imread(str(gt_path))
+                # 确保GT和SR尺寸一致
+                if gt_img.shape[:2] != sr_img.shape[:2]:
+                    print(f"  ⚠ 尺寸不匹配: SR={sr_img.shape[:2]}, GT={gt_img.shape[:2]}，跳过全参考指标")
+                    gt_img = None
+            
+            # 计算指标
+            metrics = self.metrics_calculator.calculate_all(sr_img, gt_img)
+            result.update(metrics)
+            
+            # 打印单张图像结果
+            if self.print_per_image:
+                metrics_str = ", ".join([f"{k}: {v:.4f}" for k, v in metrics.items() if not np.isnan(v)])
+                print(f"\n  {lq_path.name}: {metrics_str}")
+            
+            all_results.append(result)
+        
+        # 计算平均值
+        print("\n" + "=" * 60)
+        print("测试结果汇总")
+        print("=" * 60)
+        
+        avg_results = OrderedDict()
+        metric_keys = [k for k in all_results[0].keys() if k != 'image_name']
+        
+        for key in metric_keys:
+            values = [r[key] for r in all_results if key in r and not np.isnan(r.get(key, float('nan')))]
+            if values:
+                avg_results[key] = np.mean(values)
+                std = np.std(values)
+                print(f"  {key.upper():10s}: {avg_results[key]:.4f} ± {std:.4f}")
+        
+        # 保存结果到CSV
+        if self.save_metrics_csv:
+            csv_path = self.output_folder / 'metrics.csv'
+            with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=all_results[0].keys())
+                writer.writeheader()
+                writer.writerows(all_results)
+                # 添加平均值行
+                avg_row = {'image_name': 'AVERAGE'}
+                avg_row.update(avg_results)
+                writer.writerow(avg_row)
+            print(f"\n✓ 指标已保存到: {csv_path}")
+        
+        # 保存结果到JSON
+        if self.save_metrics_json:
+            json_path = self.output_folder / 'metrics.json'
+            output_data = {
+                'timestamp': datetime.now().isoformat(),
+                'config': {
+                    'lq_folder': str(self.lq_folder),
+                    'gt_folder': str(self.gt_folder) if self.has_gt else None,
+                    'metrics_config': self.config['metrics']
+                },
+                'average': {k: float(v) for k, v in avg_results.items()},
+                'per_image': [{k: (float(v) if isinstance(v, (int, float, np.floating)) else v) 
+                              for k, v in r.items()} for r in all_results]
             }
-        }
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, indent=2, ensure_ascii=False)
+            print(f"✓ 指标已保存到: {json_path}")
+        
+        if self.save_sr_images:
+            print(f"✓ SR图像已保存到: {sr_output_folder}")
+        
+        print("\n" + "=" * 60)
+        print("测试完成！")
+        print("=" * 60)
+        
+        return avg_results
 
-        # 保存统计信息
-        stats_path = os.path.join(save_dir, 'statistics.txt')
-        with open(stats_path, 'w', encoding='utf-8') as f:
-            f.write("=" * 60 + "\n")
-            f.write("噪声预测器诊断统计\n")
-            f.write("=" * 60 + "\n\n")
 
-            f.write(f"扩散参数:\n")
-            f.write(f"  κ (kappa) = {self.kappa}\n")
-            f.write(f"  √η_T = {self.sqrt_etas[-1].item():.6f}\n")
-            f.write(f"  κ·√η_T = {coef:.6f}\n\n")
-
-            f.write(f"z_y (LR latent):\n")
-            f.write(f"  范围: [{stats['z_y']['min']:.4f}, {stats['z_y']['max']:.4f}]\n")
-            f.write(f"  均值: {stats['z_y']['mean']:.4f}, 标准差: {stats['z_y']['std']:.4f}\n\n")
-
-            f.write(f"预测噪声:\n")
-            f.write(f"  范围: [{stats['predicted_noise']['min']:.4f}, {stats['predicted_noise']['max']:.4f}]\n")
-            f.write(f"  均值: {stats['predicted_noise']['mean']:.4f}, 标准差: {stats['predicted_noise']['std']:.4f}\n")
-            f.write(f"  [警告] 理想范围应该接近 N(0,1)，即 [-3, 3] 包含99.7%的值\n\n")
-
-            f.write(f"随机噪声 (N(0,1) 参考):\n")
-            f.write(f"  范围: [{stats['random_noise']['min']:.4f}, {stats['random_noise']['max']:.4f}]\n")
-            f.write(f"  均值: {stats['random_noise']['mean']:.4f}, 标准差: {stats['random_noise']['std']:.4f}\n\n")
-
-            f.write(f"x_T (预测噪声初始化):\n")
-            f.write(f"  范围: [{stats['x_T_predicted']['min']:.4f}, {stats['x_T_predicted']['max']:.4f}]\n")
-            f.write(f"  均值: {stats['x_T_predicted']['mean']:.4f}, 标准差: {stats['x_T_predicted']['std']:.4f}\n\n")
-
-            f.write(f"x_T (随机噪声初始化):\n")
-            f.write(f"  范围: [{stats['x_T_random']['min']:.4f}, {stats['x_T_random']['max']:.4f}]\n")
-            f.write(f"  均值: {stats['x_T_random']['mean']:.4f}, 标准差: {stats['x_T_random']['std']:.4f}\n\n")
-
-            f.write("=" * 60 + "\n")
-            f.write("诊断结论:\n")
-            f.write("=" * 60 + "\n")
-
-            # 诊断
-            pred_range = stats['predicted_noise']['max'] - stats['predicted_noise']['min']
-            if pred_range > 10:
-                f.write(f"[错误] 预测噪声范围过大 ({pred_range:.2f})，应该接近6 (正常N(0,1)的99.7%范围)\n")
-            else:
-                f.write(f"[正确] 预测噪声范围正常 ({pred_range:.2f})\n")
-
-            if abs(stats['predicted_noise']['mean']) > 0.5:
-                f.write(f"[错误] 预测噪声均值偏离0 ({stats['predicted_noise']['mean']:.4f})，应该接近0\n")
-            else:
-                f.write(f"[正确] 预测噪声均值正常 ({stats['predicted_noise']['mean']:.4f})\n")
-
-            xT_range = stats['x_T_predicted']['max'] - stats['x_T_predicted']['min']
-            if xT_range > 20:
-                f.write(f"[错误] x_T范围过大 ({xT_range:.2f})，VAE解码可能失败\n")
-            else:
-                f.write(f"[正确] x_T范围正常 ({xT_range:.2f})\n")
-
-        print(f"  统计信息已保存到: {stats_path}")
+def get_parser():
+    """获取命令行参数解析器"""
+    parser = argparse.ArgumentParser(description="超分辨率模型测试脚本")
+    
+    parser.add_argument(
+        "-c", "--config",
+        type=str,
+        default="SR/configs/test_config.yaml",
+        help="测试配置文件路径"
+    )
+    parser.add_argument(
+        "--lq_folder",
+        type=str,
+        default=None,
+        help="LQ图像文件夹路径（覆盖配置文件）"
+    )
+    parser.add_argument(
+        "--gt_folder",
+        type=str,
+        default=None,
+        help="GT图像文件夹路径（覆盖配置文件）"
+    )
+    parser.add_argument(
+        "--output_folder",
+        type=str,
+        default=None,
+        help="输出文件夹路径（覆盖配置文件）"
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        choices=["cuda", "cpu"],
+        help="计算设备（覆盖配置文件）"
+    )
+    parser.add_argument(
+        "--no_save_sr",
+        action="store_true",
+        help="不保存SR图像"
+    )
+    
+    return parser
 
 
 def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(description='噪声预测器可视化测试')
-    parser.add_argument('--config', type=str,
-                        default='SR/configs/inference_noise_predictor.yaml',
-                        help='配置文件路径')
-    parser.add_argument('--checkpoint', type=str,
-                        default='SR/pretrained/best_model.pth',
-                        help='噪声预测器权重路径')
-    parser.add_argument('--image', type=str, required=True,
-                        help='测试图像路径')
-    parser.add_argument('--output', type=str, default='test_outputs',
-                        help='输出目录')
-    parser.add_argument('--device', type=str, default='cuda',
-                        help='设备 (cuda/cpu)')
-
+    """主函数"""
+    parser = get_parser()
     args = parser.parse_args()
-
-    # 创建测试器
-    tester = NoiseVisualizationTester(
-        config_path=args.config,
-        checkpoint_path=args.checkpoint,
-        device=args.device
-    )
-
-    # 运行测试
-    tester.test_noise_prediction(
-        image_path=args.image,
-        save_dir=args.output
-    )
+    
+    print("=" * 60)
+    print("超分辨率模型测试脚本")
+    print("=" * 60)
+    
+    # 加载配置
+    with open(args.config, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+    
+    # 命令行参数覆盖配置
+    if args.lq_folder:
+        config['data']['lq_folder'] = args.lq_folder
+    if args.gt_folder:
+        config['data']['gt_folder'] = args.gt_folder
+    if args.output_folder:
+        config['data']['output_folder'] = args.output_folder
+    if args.device:
+        config['device'] = args.device
+    if args.no_save_sr:
+        config['output']['save_sr_images'] = False
+    
+    # 检查必要参数
+    if not config['data'].get('lq_folder'):
+        raise ValueError("必须指定LQ图像文件夹路径（通过配置文件或--lq_folder参数）")
+    
+    # 临时保存修改后的配置
+    temp_config_path = Path(args.config).parent / 'test_config_temp.yaml'
+    with open(temp_config_path, 'w', encoding='utf-8') as f:
+        yaml.dump(config, f, allow_unicode=True)
+    
+    try:
+        # 创建测试器并运行
+        tester = SRTester(str(temp_config_path))
+        results = tester.run()
+    finally:
+        # 清理临时文件
+        if temp_config_path.exists():
+            temp_config_path.unlink()
+    
+    return results
 
 
 if __name__ == '__main__':

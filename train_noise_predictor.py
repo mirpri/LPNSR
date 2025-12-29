@@ -1123,7 +1123,7 @@ class NoisePredictorTrainer:
 
         # 2. 计算生成器损失（噪声预测器 + 多步训练损失）
         if self.config['training']['use_amp']:
-            with autocast():
+            with autocast(device_type='cuda'):
                 loss, loss_dict = self.multi_step_training_loss(
                     z_start, z_y, lr_images_norm
                 )
@@ -1186,7 +1186,7 @@ class NoisePredictorTrainer:
 
                     # 每个step都计算判别器损失并累积梯度
                     if self.config['training']['use_amp']:
-                        with autocast():
+                        with autocast(device_type='cuda'):
                             # 判别真实图像
                             real_pred = self.discriminator(real_image)
                             d_loss_real = self.gan_loss(real_pred, target_is_real=True, is_disc=True)
