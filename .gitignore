@@ -27,3 +27,4 @@ venv/
 
 traindata/
 testdata/
+experiments/
