@@ -44,7 +44,7 @@ noise_predictor:
 # ============================================================================
 training:
   # 基础设置
-  num_epochs: 100
+  num_epochs: 50
   batch_size: 2
   num_workers: 4
 
