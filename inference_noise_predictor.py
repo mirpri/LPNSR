@@ -126,8 +126,9 @@ class ImageSpliterTh:
         self.count_pchs = 0
 
         self.im_ori = im
-        self.im_res = torch.zeros([bs, chn, height * sf, width * sf], dtype=im.dtype, device=im.device)
-        self.pixel_count = torch.zeros([bs, chn, height * sf, width * sf], dtype=im.dtype, device=im.device)
+        self.device = im.device  # 保存原始设备
+        self.im_res = torch.zeros([bs, chn, height * sf, width * sf], dtype=im.dtype, device='cpu')
+        self.pixel_count = torch.zeros([bs, chn, height * sf, width * sf], dtype=im.dtype, device='cpu')
 
     def extract_starts(self, length):
         if length <= self.pch_size:
@@ -178,7 +179,8 @@ class ImageSpliterTh:
             index_infos: [(h_start, h_end, w_start, w_end),]
         '''
         assert pch_res.shape[0] % self.true_bs == 0
-        pch_list = torch.split(pch_res, self.true_bs, dim=0)
+        pch_res_cpu = pch_res.cpu()
+        pch_list = torch.split(pch_res_cpu, self.true_bs, dim=0)
         assert len(pch_list) == len(index_infos)
         for ii, (h_start, h_end, w_start, w_end) in enumerate(index_infos):
             current_pch = pch_list[ii]
@@ -187,7 +189,8 @@ class ImageSpliterTh:
 
     def gather(self):
         assert torch.all(self.pixel_count != 0)
-        return self.im_res.div(self.pixel_count)
+        result = self.im_res.div(self.pixel_count)
+        return result.to(self.device)
 
 
 class NoisePredictorInference:

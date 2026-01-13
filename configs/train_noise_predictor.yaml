@@ -155,11 +155,11 @@ loss:
 
   # LPIPS感知损失
   lpips_weight: 2.0
-  lpips_net_type: 'vgg'  # 可选: 'alex', 'vgg', 'squeeze'
+  lpips_net_type: 'alex'  # 可选: 'alex', 'vgg', 'squeeze'
 
   # GAN对抗损失
-  gan_weight: 0.2  # GAN损失权重（生成器）
-  gan_type: 'lsgan'  # GAN类型: 'vanilla', 'lsgan', 'wgan', 'wgan-gp', 'hinge'
+  gan_weight: 0.1  # GAN损失权重（生成器）
+  gan_type: 'hinge'  # GAN类型: 'vanilla', 'lsgan', 'wgan', 'wgan-gp', 'hinge'
   disc_type: 'patch'  # 判别器类型: 'patch', 'unet'
   disc_ndf: 64  # 判别器基础通道数
   disc_n_layers: 3  # 判别器层数（仅PatchGAN）
