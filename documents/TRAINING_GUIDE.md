@@ -410,7 +410,7 @@ from LPNSR.train_noise_predictor import NoisePredictorTrainer
 trainer = NoisePredictorTrainer('LPNSR/configs/train_noise_predictor.yaml')
 
 # 加载最佳模型
-trainer.load_checkpoint('LPNSR/experiments/noise_predictor_e2e/checkpoints/best_model.pth')
+trainer.load_checkpoint('LPNSR/experiments/noise_predictor_e2e/checkpoints/noise_predictor.pth')
 
 # 进行推理
 # ...
@@ -423,7 +423,7 @@ trainer.load_checkpoint('LPNSR/experiments/noise_predictor_e2e/checkpoints/best_
 import torch
 
 # 加载checkpoint
-ckpt = torch.load('LPNSR/experiments/noise_predictor_e2e/checkpoints/best_model.pth')
+ckpt = torch.load('LPNSR/experiments/noise_predictor_e2e/checkpoints/noise_predictor.pth')
 
 # 保存噪声预测器权重
 torch.save(

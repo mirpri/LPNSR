@@ -27,7 +27,9 @@ import warnings
 # 在导入其他模块之前设置警告过滤器
 warnings.filterwarnings("ignore", message=".*A matching Triton is not available.*")
 warnings.filterwarnings("ignore", message=".*No module named 'triton'.*")
-
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 import argparse
 import yaml
 import math
@@ -110,43 +112,6 @@ def get_named_eta_schedule(
     return sqrt_etas
 
 
-class EMA:
-    """指数移动平均"""
-
-    def __init__(self, model, decay=0.9999):
-        self.model = model
-        self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-
-        # 注册参数
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-
-    def update(self):
-        """更新EMA参数"""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
-                self.shadow[name] = new_average.clone()
-
-    def apply_shadow(self):
-        """应用EMA参数"""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                self.backup[name] = param.data.clone()
-                param.data = self.shadow[name]
-
-    def restore(self):
-        """恢复原始参数"""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                param.data = self.backup[name]
-        self.backup = {}
-
-
 class NoisePredictorTrainer:
     """噪声预测器端到端训练器"""
 
@@ -180,12 +145,6 @@ class NoisePredictorTrainer:
 
         # 初始化数据加载器
         self._init_dataloaders()
-
-        # 初始化EMA
-        if self.config['training']['use_ema']:
-            self.ema = EMA(self.noise_predictor, decay=self.config['training']['ema_decay'])
-        else:
-            self.ema = None
 
         # 初始化AMP
         if self.config['training']['use_amp']:
@@ -592,26 +551,6 @@ class NoisePredictorTrainer:
         else:
             raise NotImplementedError("暂不支持直接加载LR-HR图像对")
 
-        # 验证数据加载器
-        if data_config['val']['hr_dir'] is not None:
-            print("\n创建验证数据加载器...")
-            self.val_loader = create_train_dataloader(
-                data_dir=data_config['val']['hr_dir'],
-                config_path=self.config['degradation']['config_path'],
-                batch_size=train_config['batch_size'],
-                num_workers=train_config['num_workers'],
-                gt_size=data_config['val']['crop_size'],
-                use_hflip=False,  # 验证时不使用数据增强
-                use_rot=False,
-                shuffle=False,
-                pin_memory=True
-            )
-            print(f"✓ 验证数据加载器创建成功：{len(self.val_loader)} batches")
-        else:
-            self.val_loader = None
-            print("\n未配置验证数据")
-
-        print()
 
     def _extract(self, a, t, x_shape):
         """从a中提取t对应的值，并reshape到x_shape"""
@@ -887,10 +826,12 @@ class NoisePredictorTrainer:
             # 注意：pred_image 需要保留梯度以便感知损失能够反向传播到噪声预测器
             # VAE虽然是冻结的，但梯度仍然可以通过它传回到 final_pred_x0
             pred_image = self.vae.decode(final_pred_x0)  # [-1, 1]，保留梯度
+            pred_image = pred_image*0.5+0.5
 
             # gt_image 不需要梯度
             with torch.no_grad():
                 gt_image = self.vae.decode(z_start)  # [-1, 1]
+                gt_image = gt_image*0.5+0.5
 
             # LPIPS 感知损失（图像空间）
             if self.lpips_loss is not None and loss_config.get('lpips_weight', 0) > 0:
@@ -912,44 +853,6 @@ class NoisePredictorTrainer:
             # 保存解码后的图像供判别器训练使用
             self._pred_image_for_disc = pred_image.detach()
             self._gt_image_for_disc = gt_image
-
-        loss_dict['total'] = total_loss.item()
-
-        return total_loss, loss_dict
-
-    def compute_loss(self, sr_latent, hr_latent):
-        """
-        计算损失（验证时使用，不包含GAN损失）
-
-        Args:
-            sr_latent: SR图像的潜在表示
-            hr_latent: HR图像的潜在表示
-
-        Returns:
-            total_loss: 总损失
-            loss_dict: 各项损失的字典
-        """
-        loss_dict = {}
-        total_loss = 0.0
-
-        loss_config = self.config['loss']
-
-        # L2损失
-        l2 = self.l2_loss(sr_latent, hr_latent)
-        loss_dict['l2'] = l2.item()
-        total_loss += loss_config['l2_weight'] * l2
-
-        # LPIPS感知损失（在图像空间计算）
-        if self.lpips_loss is not None and loss_config.get('lpips_weight', 0) > 0:
-            # 解码到图像空间
-            with torch.no_grad():
-                sr_image = self.vae.decode(sr_latent)  # [-1, 1]
-                hr_image = self.vae.decode(hr_latent)  # [-1, 1]
-
-            # LPIPS感知损失（图像空间）
-            lpips_val = self.lpips_loss(sr_image, hr_image)
-            loss_dict['lpips'] = lpips_val.item()
-            total_loss += loss_config['lpips_weight'] * lpips_val
 
         loss_dict['total'] = total_loss.item()
 
@@ -1017,71 +920,6 @@ class NoisePredictorTrainer:
 
         # 计算平均损失
         num_batches = len(self.train_loader)
-        avg_loss_dict = {key: value / num_batches for key, value in total_loss_dict.items()}
-
-        return avg_loss_dict
-
-    @torch.no_grad()
-    def validate(self, epoch=None):
-        """
-        验证
-
-        Args:
-            epoch: 当前epoch数
-
-        Returns:
-            avg_loss_dict: 平均损失字典
-        """
-        if self.val_loader is None:
-            return {}
-
-        if epoch is None:
-            epoch = self.current_epoch
-
-        self.noise_predictor.eval()
-
-        total_loss_dict = {}
-
-        pbar = tqdm(self.val_loader, desc="Validation")
-
-        for batch in pbar:
-            # 获取数据
-            hr_images = batch['gt'].to(self.device)
-            lr_images = batch['lq'].to(self.device)
-
-            # 编码到潜在空间
-            hr_images = hr_images * 2.0 - 1.0
-            lr_images = lr_images * 2.0 - 1.0
-
-            # HR图像直接编码
-            hr_latent = self.vae.encode(hr_images)
-
-            # LR图像需要先上采样到与HR相同尺寸，再编码
-            scale_factor = self.config['data']['val']['scale']
-            lr_images_upsampled = torch.nn.functional.interpolate(
-                lr_images, scale_factor=scale_factor, mode='bicubic', align_corners=False
-            )
-            lr_latent = self.vae.encode(lr_images_upsampled)
-
-            # 反向采样（使用推理模式，不需要梯度）
-            # 注意：lr_images是64x64的图像空间LR，用作UNet的lq条件
-            num_steps = self.config['training']['sampling_steps']
-            sr_latent = self.reverse_sampling(hr_latent, lr_latent, lr_images, num_steps)
-
-            # 计算损失
-            loss, loss_dict = self.compute_loss(sr_latent, hr_latent)
-
-            # 累积损失
-            for key, value in loss_dict.items():
-                if key not in total_loss_dict:
-                    total_loss_dict[key] = 0.0
-                total_loss_dict[key] += value
-
-            # 更新进度条
-            pbar.set_postfix({'loss': f"{loss_dict['total']:.4f}"})
-
-        # 计算平均损失
-        num_batches = len(self.val_loader)
         avg_loss_dict = {key: value / num_batches for key, value in total_loss_dict.items()}
 
         return avg_loss_dict
@@ -1229,10 +1067,6 @@ class NoisePredictorTrainer:
                             self.optimizer_d.step()
                         self.optimizer_d.zero_grad()  # 更新后清零梯度
 
-        # 只在累积完成后更新EMA
-        if is_update_step and self.ema is not None:
-            self.ema.update()
-
         return loss_dict
 
     def save_checkpoint(self, epoch, is_best=False):
@@ -1248,9 +1082,6 @@ class NoisePredictorTrainer:
             'loss_history': self.loss_history,  # 保存损失历史
         }
 
-        if self.ema is not None:
-            checkpoint['ema'] = self.ema.shadow
-
         # 保存判别器状态（如果启用GAN损失）
         if self.discriminator is not None:
             checkpoint['discriminator'] = self.discriminator.state_dict()
@@ -1264,7 +1095,7 @@ class NoisePredictorTrainer:
 
         # 保存最佳模型（只保存噪声预测器权重）
         if is_best:
-            best_path = self.exp_dir / 'checkpoints' / 'best_model.pth'
+            best_path = self.exp_dir / 'checkpoints' / 'noise_predictor.pth'
             # 只保存噪声预测器的state_dict，方便推理时直接加载
             torch.save(self.noise_predictor.state_dict(), best_path)
             print(f"✓ 最佳模型已保存（仅噪声预测器权重）: {best_path}")
@@ -1293,9 +1124,6 @@ class NoisePredictorTrainer:
         self.current_epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
         self.best_loss = checkpoint['best_loss']
-
-        if self.ema is not None and 'ema' in checkpoint:
-            self.ema.shadow = checkpoint['ema']
 
         # 加载判别器状态（如果存在）
         if self.discriminator is not None and 'discriminator' in checkpoint:
@@ -1431,14 +1259,6 @@ def main():
             if trainer.scheduler is not None:
                 trainer.scheduler.step()
                 print(f"\n当前学习率: {trainer.optimizer.param_groups[0]['lr']:.2e}")
-
-            # 验证
-            if trainer.val_loader is not None and epoch % trainer.config['experiment']['val_interval'] == 0:
-                print(f"\n验证 Epoch {epoch}...")
-                val_loss_dict = trainer.validate(epoch)
-                print(f"验证损失:")
-                for key, value in val_loss_dict.items():
-                    print(f"  {key}: {value:.4f}")
 
             # 保存checkpoint
             if epoch % trainer.config['experiment']['save_interval'] == 0:

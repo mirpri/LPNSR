@@ -41,10 +41,10 @@ python -m LPNSR.check_inference
 
 ```bash
 # 处理单张图像
-python -m LPNSR.inference_noise_predictor --input path/to/lr_image.png --output LPNSR/results
+python -m LPNSR.inference --input path/to/lr_image.png --output LPNSR/results
 
 # 处理整个文件夹
-python -m LPNSR.inference_noise_predictor --input path/to/lr_images/ --output results
+python -m LPNSR.inference --input path/to/lr_images/ --output results
 ```
 
 ---

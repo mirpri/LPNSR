@@ -12,10 +12,9 @@
 experiment:
   name: "noise_predictor"
   save_dir: "LPNSR/experiments/noise_predictor"
-  keep_recent_checkpoints: 5  # 保留最近N个checkpoint
-  log_interval: 10000  # 每N步打印一次日志
+  keep_recent_checkpoints: 3  # 保留最近N个checkpoint
+  log_interval: 5000  # 每N步打印一次日志
   save_interval: 1  # 每N个epoch保存一次checkpoint
-  val_interval: 1  # 每N个epoch验证一次
 
 # ============================================================================
 # ResShift预训练模型路径（使用SR文件夹下的模型）
@@ -45,8 +44,8 @@ noise_predictor:
 training:
   # 基础设置
   num_epochs: 50
-  batch_size: 2
-  num_workers: 4
+  batch_size: 8
+  num_workers: 16
 
 
   # ResShift扩散过程超参数（ResShift v3配置）
@@ -105,15 +104,9 @@ training:
 
   # 优化技巧
   use_amp: true  # 混合精度训练
-  use_ema: true  # 指数移动平均
-  ema_decay: 0.9999
   use_gradient_checkpointing: true  # 梯度检查点
   gradient_clip: 1.0  # 梯度裁剪
-  gradient_accumulation_steps: 16  # 梯度累积步数
-
-  # 学习率预热
-  warmup_epochs: 5
-  warmup_lr: 1.0e-6
+  gradient_accumulation_steps: 4  # 梯度累积步数
 
 # ============================================================================
 # 数据设置
@@ -130,13 +123,6 @@ data:
     use_flip: true
     use_rot: true
     use_color_jitter: false
-
-  # 验证数据
-  val:
-    hr_dir: null
-    lr_dir: null
-    crop_size: 256  # 必须是256，与预训练ResShift模型匹配
-    scale: 4
 
 # ============================================================================
 # 退化设置（如果需要生成LR图像）
@@ -162,7 +148,7 @@ loss:
   gan_type: 'hinge'  # GAN类型: 'vanilla', 'lsgan', 'wgan', 'wgan-gp', 'hinge'
   disc_type: 'patch'  # 判别器类型: 'patch', 'unet'
   disc_ndf: 64  # 判别器基础通道数
-  disc_n_layers: 3  # 判别器层数（仅PatchGAN）
+  disc_n_layers: 4  # 判别器层数（仅PatchGAN）
   disc_norm_type: 'spectral'  # 判别器归一化类型: 'batch', 'instance', 'spectral', 'none'
   disc_lr: 1.0e-4  # 判别器学习率
   disc_start_epoch: 0  # 判别器开始训练的epoch（可以让生成器先预热）
@@ -189,14 +175,6 @@ scheduler:
   # StepLR参数
   step_size: 50
   gamma: 0.5
-
-# ============================================================================
-# 验证设置
-# ============================================================================
-validation:
-  num_samples: 4  # 验证时生成的样本数
-  save_images: true  # 是否保存验证图像
-  compute_metrics: true  # 是否计算指标（PSNR, SSIM等）
 
 # ============================================================================
 # 硬件设置
