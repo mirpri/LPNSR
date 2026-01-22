@@ -160,14 +160,6 @@ class NoisePredictorTrainer:
         self.global_step = 0
         self.best_loss = float('inf')
 
-        # 损失记录列表（用于论文绘图）
-        self.loss_history = {
-            'epoch': [],
-            'random_noise_l2': [],  # 随机噪声的L2损失
-            'predicted_noise_l2': [],  # 噪声预测器的L2损失
-            'improvement_percent': [],  # 改进百分比
-        }
-
         print(f"训练器初始化完成！")
         print(f"实验目录: {self.exp_dir}")
         print(f"设备: {self.device}")
@@ -350,12 +342,6 @@ class NoisePredictorTrainer:
         print(f"  - 采样步数S: {self.sampling_steps}")
         print(f"  - 输入归一化: {self.normalize_input}")
         print(f"  - 初始化分布: N(y, κ²·η_T·I) = N(y, {self.kappa ** 2 * self.etas[-1]:.4f}·I)")
-        print(f"\n  ResShift扩散公式：")
-        print(f"  - 前向: x_t = (1-η_t)·x_0 + η_t·y + √η_t·κ·ε")
-        print(f"  - 后验: μ = (η_{{t-1}}/η_t)·x_t + (α_t/η_t)·x_0")
-        print(f"  - 方差: σ² = κ²·(η_{{t-1}}/η_t)·α_t")
-        print(f"  - posterior_mean_coef1: {self.posterior_mean_coef1.numpy()}")
-        print(f"  - posterior_mean_coef2: {self.posterior_mean_coef2.numpy()}")
 
         # 5. 创建噪声预测器（训练）
         print("\n创建噪声预测器...")
@@ -602,73 +588,6 @@ class NoisePredictorTrainer:
 
         return posterior_mean, posterior_variance, posterior_log_variance
 
-    @torch.no_grad()
-    def p_sample_with_noise_predictor(self, x_t, y, lr_image, t_tensor):
-        """
-        使用噪声预测器的采样步骤
-
-        Args:
-            x_t: 当前时间步的含噪潜在表示 [B, C, H, W]
-            y: LR图像的潜在表示 [B, C, H, W]
-            lr_image: 图像空间的LR图像（用作UNet的lq条件）
-            t_tensor: 时间步张量 [B]
-
-        Returns:
-            x_{t-1}: 下一时间步的潜在表示
-        """
-        # 1. 对输入进行归一化（ResShift的关键步骤！）
-        x_t_normalized = self._scale_input(x_t, t_tensor)
-
-        # 2. 使用ResShift的UNet预测x_0
-        # 注意：lq应该是图像空间的LR图像，不是潜在空间的y！
-        pred_x0 = self.resshift_unet(x_t_normalized, t_tensor, lq=lr_image)
-
-        # 3. 计算后验分布 q(x_{t-1} | x_t, x_0)
-        mean, variance, log_variance = self.q_posterior_mean_variance(pred_x0, x_t, t_tensor)
-
-        # 4. 使用噪声预测器生成噪声（替代随机噪声）
-        # 与InvSR一致：噪声预测器只需要 y (LR latent) 和时间步
-        # 推理时不需要梯度
-        with torch.no_grad():
-            # sample_posterior=True：从分布中采样噪声
-            predicted_noise = self.noise_predictor(x_t, y, t_tensor, sample_posterior=True)
-
-        # 5. 采样x_{t-1}
-        nonzero_mask = (t_tensor != 0).float().view(-1, 1, 1, 1)
-        sample = mean + nonzero_mask * torch.exp(0.5 * log_variance) * predicted_noise
-
-        return sample
-
-    @torch.no_grad()
-    def reverse_sampling(self, hr_latent, lr_latent, lr_image, num_steps):
-        """
-        完整的ResShift反向采样过程（推理时使用）
-
-        ResShift v3直接用4步训练，所以时间步直接从0到num_timesteps-1
-
-        Args:
-            hr_latent: HR图像的潜在表示（未使用，保留接口兼容性）
-            lr_latent: LR图像的潜在表示 y
-            lr_image: 图像空间的LR图像（用作UNet的lq条件）
-            num_steps: 采样步数S（应该等于num_timesteps）
-
-        Returns:
-            x_0: 最终的潜在表示
-        """
-        # ResShift初始化：x_T = y + κ·√η_T·ε
-        t_init = self.num_timesteps - 1
-        sqrt_eta_T = self.sqrt_etas[t_init].to(lr_latent.device)
-        x_t = lr_latent + self.kappa * sqrt_eta_T * torch.randn_like(lr_latent)
-
-        # 反向采样：\u4ecnum_timesteps-1到0
-        indices = list(range(self.num_timesteps))[::-1]  # [num_timesteps-1, ..., 0]
-
-        for i in indices:
-            t_tensor = torch.full((lr_latent.shape[0],), i, device=self.device, dtype=torch.long)
-            x_t = self.p_sample_with_noise_predictor(x_t, lr_latent, lr_image, t_tensor)
-
-        return x_t
-
     def multi_step_training_loss(self, z_start, z_y, lr_image):
         """
         多步训练损失计算 - 与推理流程完全一致
@@ -777,11 +696,6 @@ class NoisePredictorTrainer:
                 # 计算改进百分比
                 improvement = (baseline_l2 - current_l2) / baseline_l2 * 100
 
-                # 记录到损失历史
-                self.loss_history['epoch'].append(self.current_epoch)
-                self.loss_history['random_noise_l2'].append(baseline_l2)
-                self.loss_history['predicted_noise_l2'].append(current_l2)
-                self.loss_history['improvement_percent'].append(improvement)
                 print(
                     f"[多步对比 Epoch {self.current_epoch}] 随机噪声LPIPS: {baseline_lpips:.4f} | 预测噪声LPIPS: {current_lpips:.4f}"
                     )
@@ -1080,7 +994,6 @@ class NoisePredictorTrainer:
             'scheduler': self.scheduler.state_dict() if self.scheduler else None,
             'best_loss': self.best_loss,
             'config': self.config,
-            'loss_history': self.loss_history,  # 保存损失历史
         }
 
         # 保存判别器状态（如果启用GAN损失）
@@ -1134,87 +1047,12 @@ class NoisePredictorTrainer:
             self.optimizer_d.load_state_dict(checkpoint['optimizer_d'])
             print(f"  - 已加载判别器优化器状态")
 
-        # 加载损失历史（如果存在）
-        if 'loss_history' in checkpoint:
-            self.loss_history = checkpoint['loss_history']
-            print(f"  - 已加载 {len(self.loss_history['epoch'])} 个epoch的损失历史")
-
         print(f"✓ Checkpoint已加载: {checkpoint_path}")
         print(f"  - Epoch: {self.current_epoch}")
         print(f"  - Global step: {self.global_step}")
         print(f"  - Best loss: {self.best_loss:.6f}")
 
         return checkpoint
-
-
-def plot_loss_comparison(loss_history, save_path, title='L2 Loss Comparison: Random Noise vs Predicted Noise'):
-    """
-    绘制随机噪声和预测噪声的L2损失对比图（用于论文）
-
-    Args:
-        loss_history: 损失历史字典
-        save_path: 保存路径
-        title: 图表标题
-    """
-    if len(loss_history['epoch']) == 0:
-        print("警告: 没有损失历史数据可供绘图")
-        return
-
-    epochs = loss_history['epoch']
-    random_l2 = loss_history['random_noise_l2']
-    predicted_l2 = loss_history['predicted_noise_l2']
-    improvement = loss_history['improvement_percent']
-
-    # 设置论文级别的图表样式
-    plt.style.use('seaborn-v0_8-whitegrid')
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-    # 子图1: L2损失对比
-    ax1.plot(epochs, random_l2, 'b-o', label='Random Noise', linewidth=2, markersize=4)
-    ax1.plot(epochs, predicted_l2, 'r-s', label='Predicted Noise', linewidth=2, markersize=4)
-    ax1.set_xlabel('Epoch', fontsize=12)
-    ax1.set_ylabel('L2 Loss', fontsize=12)
-    ax1.set_title('L2 Loss Comparison', fontsize=14)
-    ax1.legend(fontsize=10)
-    ax1.grid(True, alpha=0.3)
-
-    # 添加最终值标注
-    ax1.annotate(f'{random_l2[-1]:.4f}', xy=(epochs[-1], random_l2[-1]),
-                 xytext=(5, 5), textcoords='offset points', fontsize=9, color='blue')
-    ax1.annotate(f'{predicted_l2[-1]:.4f}', xy=(epochs[-1], predicted_l2[-1]),
-                 xytext=(5, -10), textcoords='offset points', fontsize=9, color='red')
-
-    # 子图2: 改进百分比
-    colors = ['green' if x > 0 else 'red' for x in improvement]
-    ax2.bar(epochs, improvement, color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
-    ax2.axhline(y=0, color='black', linestyle='-', linewidth=1)
-    ax2.set_xlabel('Epoch', fontsize=12)
-    ax2.set_ylabel('Improvement (%)', fontsize=12)
-    ax2.set_title('Improvement of Predicted Noise over Random Noise', fontsize=14)
-    ax2.grid(True, alpha=0.3, axis='y')
-
-    # 添加平均改进值
-    avg_improvement = np.mean(improvement)
-    ax2.axhline(y=avg_improvement, color='orange', linestyle='--', linewidth=2,
-                label=f'Average: {avg_improvement:.2f}%')
-    ax2.legend(fontsize=10)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-
-    print(f"✓ L2损失对比图已保存: {save_path}")
-
-    # 同时保存为CSV格式，方便后续处理
-    csv_path = save_path.replace('.png', '.csv').replace('.pdf', '.csv')
-    import csv
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Epoch', 'Random_Noise_L2', 'Predicted_Noise_L2', 'Improvement_Percent'])
-        for i in range(len(epochs)):
-            writer.writerow([epochs[i], random_l2[i], predicted_l2[i], improvement[i]])
-    print(f"✓ 损失数据CSV已保存: {csv_path}")
-
 
 def main():
     parser = argparse.ArgumentParser(description='训练噪声预测器（单步训练）')
@@ -1272,26 +1110,11 @@ def main():
         print("训练完成！")
         print("=" * 70)
 
-        # 绘制并保存L2损失对比图
-        print("\n生成L2损失对比图...")
-        plot_save_path = str(trainer.exp_dir / 'l2_loss_comparison.png')
-        plot_loss_comparison(trainer.loss_history, plot_save_path)
-
-        # 同时保存PDF版本（适合论文使用）
-        plot_save_path_pdf = str(trainer.exp_dir / 'l2_loss_comparison.pdf')
-        plot_loss_comparison(trainer.loss_history, plot_save_path_pdf)
-
     except KeyboardInterrupt:
         print("\n\n训练被中断！")
         print("保存当前checkpoint...")
         trainer.save_checkpoint(epoch, is_best=False)
         print("Checkpoint已保存，可以使用--resume恢复训练")
-
-        # 绘制并保存当前的L2损失对比图
-        if len(trainer.loss_history['epoch']) > 0:
-            print("\n生成当前L2损失对比图...")
-            plot_save_path = str(trainer.exp_dir / 'l2_loss_comparison_interrupted.png')
-            plot_loss_comparison(trainer.loss_history, plot_save_path)
 
 
 if __name__ == '__main__':

@@ -319,6 +319,23 @@ class InitializerTrainer:
         self.sqrt_etas = torch.tensor(self.sqrt_etas, dtype=torch.float32).to(self.device)
         self.etas = self.sqrt_etas ** 2
 
+        # 计算alpha（ResShift定义：alpha_t = eta_t - eta_{t-1}）
+        self.etas_prev = torch.cat([torch.zeros(1, device=self.device), self.etas[:-1]])
+        self.alpha = self.etas - self.etas_prev
+
+        # 计算后验分布参数
+        self.posterior_variance = self.kappa ** 2 * self.etas_prev / self.etas * self.alpha
+        # 处理t=0时的方差（避免除以0和NaN）
+        self.posterior_variance_clipped = torch.cat([self.posterior_variance[[1]], self.posterior_variance[1:]])
+        self.posterior_log_variance_clipped = torch.log(self.posterior_variance_clipped)
+
+        # 后验均值系数
+        self.posterior_mean_coef1 = self.etas_prev / self.etas  # η_{t-1}/η_t
+        self.posterior_mean_coef2 = self.alpha / self.etas  # α_t/η_t
+        # 处理t=0时的除以0问题
+        self.posterior_mean_coef1[0] = 0.0
+        self.posterior_mean_coef2[0] = 1.0
+
         print(f"\n✓ ResShift扩散参数初始化完成")
         print(f"  - 扩散步数: {self.num_timesteps}")
         print(f"  - kappa: {self.kappa}")
@@ -339,6 +356,81 @@ class InitializerTrainer:
         """
         std = torch.sqrt(self._extract(self.etas, t, x_t.shape) * self.kappa ** 2 + 1)
         return x_t / std
+
+    def q_posterior_mean_variance(self, x_0, x_t, t):
+        """
+        计算ResShift后验分布 q(x_{t-1}|x_t, x_0)
+
+        后验均值：μ = (η_{t-1}/η_t)·x_t + (α_t/η_t)·x_0
+        后验方差：σ² = κ²·η_{t-1}·α_t/η_t
+
+        其中 α_t = η_t - η_{t-1}（ResShift定义）
+
+        Args:
+            x_0: 预测的x_0
+            x_t: 当前x_t
+            t: 时间步索引
+
+        Returns:
+            mean: 后验均值
+            variance: 后验方差
+            log_variance: 后验方差的对数
+        """
+        # 使用预计算的系数
+        mean = (
+            self._extract(self.posterior_mean_coef1, t, x_t.shape) * x_t
+            + self._extract(self.posterior_mean_coef2, t, x_t.shape) * x_0
+        )
+
+        variance = self._extract(self.posterior_variance, t, x_t.shape)
+        log_variance = self._extract(self.posterior_log_variance_clipped, t, x_t.shape)
+
+        return mean, variance, log_variance
+
+    def reverse_sampling_with_grad(self, x_start_t, z_y, lr_image, t_start):
+        """
+        从给定的 x_t 开始，经过完整的反向采样链生成 x_0
+
+        与推理时的 reverse_sampling 不同的是：
+        1. 从任意时间步 t_start 开始，而不是固定的 T-1
+        2. 不使用噪声预测器，使用随机高斯噪声（训练阶段）
+        3. 保持梯度流动（不使用 torch.no_grad()）
+
+        Args:
+            x_start_t: 初始化的 x_t [B, C, H, W]
+            z_y: LR图像的潜在表示（用于后续采样的条件）[B, C, H, W]
+            lr_image: 图像空间的LR图像（用作UNet的lq条件）[B, 3, H, W]
+            t_start: 起始时间步索引
+
+        Returns:
+            x_0: 最终预测的x_0
+        """
+        x_t = x_start_t
+
+        # 从 t_start 反向采样到 0
+        indices = list(range(t_start, -1, -1))  # [t_start, t_start-1, ..., 0]
+
+        for i in indices:
+            # 创建时间步tensor
+            t_tensor = torch.full((x_t.shape[0],), i, device=self.device, dtype=torch.long)
+
+            # 归一化输入
+            x_t_normalized = self._scale_input(x_t, t_tensor)
+
+            # 使用UNet预测x_0
+            pred_x0 = self.resshift_unet(x_t_normalized, t_tensor, lq=lr_image)
+
+            # 计算后验分布
+            mean, variance, log_variance = self.q_posterior_mean_variance(pred_x0, x_t, t_tensor)
+
+            # 使用随机高斯噪声（训练阶段不使用噪声预测器）
+            noise = torch.randn_like(x_t)
+
+            # 采样 x_{t-1}：当 i>0 时添加噪声，i=0 时直接使用均值
+            nonzero_mask = (t_tensor != 0).float().view(-1, 1, 1, 1)
+            x_t = mean + nonzero_mask * torch.exp(0.5 * log_variance) * noise
+
+        return x_t
 
     def _init_losses(self):
         """初始化损失函数"""
@@ -489,7 +581,7 @@ class InitializerTrainer:
         1. 从T=4,3,2,1随机采样一个时间步
         2. 使用initializer生成噪声
         3. 使用ResShift初始化公式生成x_t: x_t = z_y + κ·√η_t·predicted_noise
-        4. 使用UNet预测x_0
+        4. 从x_t经过完整的反向采样链生成x_0
         5. 计算x_0与真实z_start的损失
 
         Args:
@@ -507,20 +599,20 @@ class InitializerTrainer:
         # 1. 随机采样时间步：从[4, 3, 2, 1]中随机选择（注意：ResShift的时间步是0-based）
         # ResShift的时间步：0, 1, 2, 3 (共4步)
         # 我们从T=4,3,2,1随机采样，对应时间步索引为[3, 2, 1, 0]
-        t = torch.randint(0, self.num_timesteps, (batch_size,), device=self.device)
+        # 注意：为了使反向采样链高效，整个batch使用统一的时间步
+        t = torch.randint(0, self.num_timesteps, (1,), device=self.device).item()  # 采样一个标量
+        t_tensor = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
 
         # 2. 使用initializer生成噪声
-        predicted_noise = self.initializer(z_y, t, sample_posterior=True)
+        predicted_noise = self.initializer(z_y, t_tensor, sample_posterior=True)
 
         # 3. 使用ResShift初始化公式生成x_t
         # x_t = z_y + κ·√η_t·predicted_noise
-        sqrt_eta_t = self._extract(self.sqrt_etas, t, z_y.shape)
+        sqrt_eta_t = self._extract(self.sqrt_etas, t_tensor, z_y.shape)
         x_t = z_y + self.kappa * sqrt_eta_t * predicted_noise
 
-        # 4. 使用UNet预测x_0
-        # 首先归一化输入
-        x_t_normalized = self._scale_input(x_t, t)
-        pred_x0 = self.resshift_unet(x_t_normalized, t, lq=lr_image)
+        # 4. 从x_t经过完整的反向采样链生成x_0
+        pred_x0 = self.reverse_sampling_with_grad(x_t, z_y, lr_image, t)
 
         # 5. 计算损失
         loss_config = self.config['loss']

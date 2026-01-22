@@ -905,6 +905,9 @@ class NoisePredictorInference:
             with context():
                 sr_tensor = self.sample_func(lr_tensor)
 
+        # 5. 反归一化到[0, 1]（sr_tensor已在sample_func中clamp到[-1,1]）
+        sr_tensor = sr_tensor * 0.5 + 0.5
+
         #进行颜色校正
         if self.color_correction:
             lr_upsampled_full = F.interpolate(
@@ -913,10 +916,10 @@ class NoisePredictorInference:
                 mode='bicubic',
                 align_corners=False
             )
+            lr_upsampled_full=lr_upsampled_full*0.5+0.5
             sr_tensor = self._color_correction(sr_tensor, lr_upsampled_full)
             print(f"  ✓ 对图像应用颜色校正")
-        # 5. 反归一化到[0, 1]（sr_tensor已在sample_func中clamp到[-1,1]）
-        sr_tensor = sr_tensor * 0.5 + 0.5
+
         # 额外clamp确保在[0, 1]范围内
         sr_tensor = torch.clamp(sr_tensor, 0, 1)
 
@@ -1048,7 +1051,7 @@ def main():
     # 覆盖采样步数
     if args.num_steps is not None:
         inferencer.num_steps = args.num_steps
-        print(f"采样步数已覆盖为: {args.num_steps}")
+        print(f"采样步数已覆盖为: {inferencer.num_steps}")
 
     # 覆盖噪声模式
     if args.disable_noise_predictor:
