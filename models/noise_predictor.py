@@ -236,6 +236,7 @@ class EDSRUnetNoisePredictor(nn.Module):
             decoder_channel_sizes.append(current_channels)
             
             block = nn.ModuleList()
+            
             # 添加多个残差块
             for _ in range(num_res_blocks):
                 block.append(
@@ -246,7 +247,7 @@ class EDSRUnetNoisePredictor(nn.Module):
                         res_scale
                     )
                 )
-
+            
             # 添加上采样（最后一层不上采样）
             if level > 0:
                 block.append(Upsample(current_channels))
@@ -257,21 +258,23 @@ class EDSRUnetNoisePredictor(nn.Module):
         # 创建跳跃连接的通道匹配卷积
         self.skip_convs = nn.ModuleList()
         
-        # 编码器保存的通道数列表（下采样前的）
+        # 编码器保存的通道数列表（每个level处理后的通道数）
         encoder_channels_list = []
         current_channels = model_channels
         for level in range(self.num_levels):
+            # 每个level处理完后保存的通道数
             encoder_channels_list.append(current_channels)
             if level < self.num_levels - 1:
                 # 下采样后通道翻倍
                 current_channels *= 2
-        # 添加最后一个（最深层）
-        encoder_channels_list.append(current_channels)
         
         # 为每个解码器层创建对应的跳跃连接卷积
+        # 解码器从深层到浅层，编码器从浅层到深层
+        # 因此需要反向匹配：decoder_level 0使用encoder_level (num_levels-1)
         for i in range(self.num_levels):
-            # 从后往前取编码器保存的通道数（跳过最后一个）
-            encoder_channels = encoder_channels_list[-(i+2)]
+            # 解码器第i层对应编码器第(num_levels-1-i)层
+            encoder_idx = self.num_levels - 1 - i
+            encoder_channels = encoder_channels_list[encoder_idx]
             # 对应解码器层的输入通道数
             decoder_channels = decoder_channel_sizes[i]
             
@@ -311,6 +314,7 @@ class EDSRUnetNoisePredictor(nn.Module):
         # 编码器前向
         skip_connections = []
         for level in range(self.num_levels):
+            # 先经过所有residual blocks
             for i, block in enumerate(self.encoder[level]):
                 if isinstance(block, EDSRTimeModulatedBlock):
                     x = block(x, t_emb)
@@ -318,49 +322,38 @@ class EDSRUnetNoisePredictor(nn.Module):
                     # 在下采样前保存特征
                     skip_connections.append(x.clone())
                     x = block(x)
-            # 如果是最后一层，也需要保存特征
+            
+            # 如果是最后一层，需要保存特征
+            # 注意：最后一层没有下采样，所以需要在这里保存
             if level == self.num_levels - 1:
                 skip_connections.append(x.clone())
+
+        # 反转skip_connections顺序，使其与decoder的顺序一致
+        # encoder: [level0, level1, level2, level3] -> [浅层到深层]
+        # decoder需要: [level3, level2, level1, level0] -> [深层到浅层]
+        skip_connections = skip_connections[::-1]
 
         # 瓶颈层
         for block in self.bottleneck:
             x = block(x, t_emb)
 
         # 解码器前向
-        # 注意：现在skip_connections包含了所有的跳跃连接，包括最后一个
-        # 从后往前使用：第一个使用的是最后一个下采样前的特征，以此类推
-        skip_idx = len(skip_connections) - 1
-        
+        # skip_connections现在是 [level3, level2, level1, level0]，与decoder顺序一致
         for level in range(self.num_levels):
             # 获取对应的跳跃连接
-            skip = skip_connections[skip_idx]
-            skip_idx -= 1
-            
+            skip = skip_connections[level]
+
             # 跳跃连接通道匹配
             skip = self.skip_convs[level](skip)
-            
-            # 确保空间尺寸匹配（可能需要裁剪或填充）
-            if skip.shape[2:] != x.shape[2:]:
-                # 使用中心裁剪或填充来匹配尺寸
-                skip_h, skip_w = skip.shape[2], skip.shape[3]
-                x_h, x_w = x.shape[2], x.shape[3]
-                
-                if skip_h > x_h or skip_w > x_w:
-                    # 裁剪
-                    skip = skip[:, :, :x_h, :x_w]
-                else:
-                    # 填充
-                    pad_h = x_h - skip_h
-                    pad_w = x_w - skip_w
-                    skip = F.pad(skip, (0, pad_w, 0, pad_h))
-            
-            # 跳跃连接融合
+
+            # 跳跃连接融合（在处理任何block之前，确保尺寸匹配）
             x = x + skip
 
-            for i, block in enumerate(self.decoder[level]):
+            # 经过该层的所有blocks（residual blocks和upsample）
+            for block in self.decoder[level]:
                 if isinstance(block, EDSRTimeModulatedBlock):
                     x = block(x, t_emb)
-                else:  # 上采样
+                elif isinstance(block, Upsample):
                     x = block(x)
 
         # 输出处理
