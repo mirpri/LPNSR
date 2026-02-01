@@ -19,6 +19,7 @@ from .noise_predictor import (
     NoisePredictorOutput,
     create_noise_predictor,
 )
+from .swinir_sr import create_swinir, SwinIRWrapper
 
 __all__ = [
     'UNetModelSwin',
@@ -28,6 +29,8 @@ __all__ = [
     'DiagonalGaussianDistribution',
     'NoisePredictorOutput',
     'create_noise_predictor',
+    'create_swinir',
+    'SwinIRWrapper',
     'conv_nd',
     'linear',
     'avg_pool_nd',

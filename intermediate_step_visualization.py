@@ -4,11 +4,10 @@
 中间状态可视化脚本
 
 功能：
-1. 可视化反向扩散过程中每一步的中间状态图
-2. 对比两种不同的噪声策略：
-   - 模式A：随机噪声初始化 + 随机噪声采样（原始ResShift）
-   - 模式B：随机噪声初始化 + 噪声预测器采样
-3. 生成对比图表，方便分析不同策略的差异
+1. 可视化Initializer和NoisePredictor的输出
+2. Initializer输出：生成初始噪声预测（用于x_T初始化）
+3. NoisePredictor输出：在反向扩散过程中生成每一步的噪声预测
+4. 帮助分析初始化器和噪声预测器的工作原理
 """
 
 import os
@@ -38,6 +37,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 # LPNSR模块导入
 from LPNSR.models.noise_predictor import create_noise_predictor
+from LPNSR.models.initializer import create_initializer
 from LPNSR.models.unet import UNetModelSwin
 from LPNSR.ldm.models.autoencoder import VQModelTorch
 
@@ -83,8 +83,8 @@ def get_named_eta_schedule(
     return sqrt_etas
 
 
-class IntermediateStepVisualizer:
-    """中间状态可视化类"""
+class ModelOutputsVisualizer:
+    """Initializer和NoisePredictor输出可视化类"""
 
     def __init__(self, config_path, device='cuda'):
         """
@@ -122,6 +122,7 @@ class IntermediateStepVisualizer:
         print(f"✓ 可视化器初始化完成")
         print(f"  - 采样步数: {self.num_steps}")
         print(f"  - 超分倍数: {self.scale_factor}x")
+        print(f"  - Initializer: {'已加载' if self.initializer is not None else '未加载'}")
 
     def _init_models(self):
         """初始化模型"""
@@ -262,6 +263,56 @@ class IntermediateStepVisualizer:
             param.requires_grad = False
         print("  ✓ 噪声预测器加载完成")
 
+        # 4. 加载Initializer
+        print("  加载Initializer...")
+        if self.config['inference'].get('use_initializer', False) and 'initializer_path' in self.config['model']:
+            initializer_config = self.config['initializer']
+
+            if 'config_path' in initializer_config:
+                with open(initializer_config['config_path'], 'r', encoding='utf-8') as f:
+                    init_config = yaml.safe_load(f)
+                self.initializer = create_initializer(
+                    latent_channels=init_config['latent_channels'],
+                    model_channels=init_config['model_channels'],
+                    channel_mult=tuple(init_config['channel_mult']),
+                    num_res_blocks=init_config['num_res_blocks'],
+                    growth_rate=init_config['growth_rate'],
+                    res_scale=init_config['res_scale'],
+                    double_z=init_config['double_z']
+                )
+            else:
+                self.initializer = create_initializer(
+                    latent_channels=initializer_config['latent_channels'],
+                    model_channels=initializer_config['model_channels'],
+                    channel_mult=tuple(initializer_config['channel_mult']),
+                    num_res_blocks=initializer_config['num_res_blocks'],
+                    growth_rate=initializer_config.get('growth_rate', 32),
+                    res_scale=initializer_config.get('res_scale', 0.1),
+                    double_z=initializer_config.get('double_z', True)
+                )
+
+            init_ckpt = torch.load(self.config['model']['initializer_path'], map_location='cpu')
+
+            if isinstance(init_ckpt, dict):
+                if 'initializer_state_dict' in init_ckpt:
+                    state_dict = init_ckpt['initializer_state_dict']
+                elif 'model_state_dict' in init_ckpt:
+                    state_dict = init_ckpt['model_state_dict']
+                else:
+                    state_dict = init_ckpt
+            else:
+                state_dict = init_ckpt
+
+            self.initializer.load_state_dict(state_dict, strict=True)
+            self.initializer = self.initializer.to(self.device)
+            self.initializer.eval()
+            for param in self.initializer.parameters():
+                param.requires_grad = False
+            print("  ✓ Initializer加载完成")
+        else:
+            self.initializer = None
+            print("  ! Initializer未配置，模式C和模式D将不可用")
+
     def _init_diffusion(self):
         """初始化扩散参数"""
         diffusion_config = self.config['diffusion']
@@ -358,14 +409,14 @@ class IntermediateStepVisualizer:
         noise = torch.randn_like(y)
         return y + self._extract_into_tensor(self.kappa * self.sqrt_etas, t, y.shape) * noise
 
-    def prior_sample_predicted(self, y, lr_latent):
+    def prior_sample_initializer(self, y):
         """
-        使用噪声预测器从先验分布采样
+        使用Initializer从先验分布采样
         q(x_T|y) ~= N(x_T|y, κ²η_T)
         """
         t = torch.tensor([self.num_steps - 1] * y.shape[0], device=y.device).long()
-        # 使用噪声预测器预测噪声
-        noise = self.noise_predictor(y, lr_latent, t, sample_posterior=True)
+        # 使用Initializer预测噪声
+        noise = self.initializer(y, t, sample_posterior=True)
         return y + self._extract_into_tensor(self.kappa * self.sqrt_etas, t, y.shape) * noise
 
     def _wavelet_blur(self, image: torch.Tensor, radius: int):
@@ -415,33 +466,33 @@ class IntermediateStepVisualizer:
         return img
 
     @torch.no_grad()
-    def reverse_sampling_with_intermediate(self, lr_latent, lr_image, use_random_noise=True,
-                                           use_random_init=True):
+    def reverse_sampling_with_outputs(self, lr_latent, lr_image):
         """
-        反向采样过程，返回每一步的中间状态
+        反向采样过程，收集Initializer和NoisePredictor的输出
 
         Args:
             lr_latent: LR图像的潜在表示
             lr_image: 图像空间的LR图像（用作UNet的lq条件）
-            use_random_noise: 是否在中间步骤使用随机噪声
-            use_random_init: 是否使用随机噪声初始化（否则使用噪声预测器）
 
         Returns:
-            intermediate_states: 每一步的中间状态列表（潜在空间）
+            initializer_output: Initializer的输出（初始噪声）
+            noise_predictor_outputs: NoisePredictor在每一步的输出列表
             intermediate_images: 每一步的中间状态图像列表
         """
-        # 存储中间状态
-        intermediate_latents = []
+        noise_predictor_outputs = []
         intermediate_images = []
 
-        # 初始化x_T
-        if use_random_init:
-            x_t = self.prior_sample_random(lr_latent)
+        # 使用Initializer生成初始噪声
+        t_T = torch.tensor([self.num_steps - 1] * lr_latent.shape[0], device=self.device).long()
+        if self.initializer is not None:
+            initializer_output = self.initializer(lr_latent, t_T, sample_posterior=True)
         else:
-            x_t = self.prior_sample_predicted(lr_latent, lr_latent)
+            initializer_output = torch.randn_like(lr_latent)
+
+        # 初始化x_T
+        x_t = lr_latent + self._extract_into_tensor(self.kappa * self.sqrt_etas, t_T, lr_latent.shape) * initializer_output
 
         # 保存初始状态 (x_T)
-        intermediate_latents.append(x_t.clone())
         intermediate_images.append(self.latent_to_image(x_t))
 
         # 反向采样：从num_steps-1到0
@@ -459,21 +510,18 @@ class IntermediateStepVisualizer:
             # 3. 计算ResShift后验分布
             mean, variance, log_variance = self.q_posterior_mean_variance(pred_x0, x_t, t_tensor)
 
-            # 4. 生成噪声
-            if use_random_noise:
-                noise = torch.randn_like(x_t)
-            else:
-                noise = self.noise_predictor(x_t, lr_latent, t_tensor, sample_posterior=True)
+            # 4. 使用NoisePredictor生成噪声
+            noise = self.noise_predictor(x_t, lr_latent, t_tensor, sample_posterior=True)
+            noise_predictor_outputs.append(noise.clone())
 
             # 5. 采样x_{t-1}
             nonzero_mask = (t_tensor != 0).float().view(-1, 1, 1, 1)
             x_t = mean + nonzero_mask * torch.exp(0.5 * log_variance) * noise
 
             # 保存中间状态
-            intermediate_latents.append(x_t.clone())
             intermediate_images.append(self.latent_to_image(x_t))
 
-        return intermediate_latents, intermediate_images
+        return initializer_output, noise_predictor_outputs, intermediate_images
 
     def pad_image(self, img, multiple=64):
         """Padding图像到multiple的倍数"""
@@ -488,7 +536,7 @@ class IntermediateStepVisualizer:
 
     def visualize_intermediate_steps(self, lr_image_path, output_path):
         """
-        可视化中间步骤
+        可视化Initializer和NoisePredictor的输出
 
         Args:
             lr_image_path: LR图像路径
@@ -525,16 +573,9 @@ class IntermediateStepVisualizer:
 
         print("  开始采样...")
 
-        # 模式A：随机噪声初始化 + 随机噪声采样
-        print("  模式A: 随机噪声初始化 + 随机噪声采样")
-        _, images_mode_a = self.reverse_sampling_with_intermediate(
-            lr_latent, lr_tensor, use_random_noise=True, use_random_init=True
-        )
-
-        # 模式B：随机噪声初始化 + 噪声预测器采样
-        print("  模式B: 随机噪声初始化 + 噪声预测器采样")
-        _, images_mode_b = self.reverse_sampling_with_intermediate(
-            lr_latent, lr_tensor, use_random_noise=False, use_random_init=True
+        # 运行反向采样，收集Initializer和NoisePredictor的输出
+        initializer_output, noise_predictor_outputs, intermediate_images = self.reverse_sampling_with_outputs(
+            lr_latent, lr_tensor
         )
 
         # 创建输出目录
@@ -556,46 +597,62 @@ class IntermediateStepVisualizer:
             lr_upsampled_display = lr_upsampled_display[:h_end, :w_end]
 
             # 对所有中间状态图像去除padding
-            for i in range(len(images_mode_a)):
-                images_mode_a[i] = images_mode_a[i][:h_end, :w_end]
-                images_mode_b[i] = images_mode_b[i][:h_end, :w_end]
+            for i in range(len(intermediate_images)):
+                intermediate_images[i] = intermediate_images[i][:h_end, :w_end]
 
-        # 创建对比图
-        self._create_comparison_figure(
+        # 创建可视化图
+        self._create_model_outputs_figure(
             lr_image, lr_upsampled_display,
-            images_mode_a, images_mode_b,
-            output_path / f"{img_name}_comparison.png"
+            initializer_output, noise_predictor_outputs,
+            output_path / f"{img_name}_model_outputs.png",
+            h_end if pad_h > 0 or pad_w > 0 else None,
+            w_end if pad_h > 0 or pad_w > 0 else None
         )
 
-        # 保存单独的中间状态图像
-        self._save_individual_images(
-            images_mode_a, images_mode_b,
-            output_path, img_name
+        # 保存初始噪声图和每一步的中间噪声图
+        self._save_noise_images(
+            initializer_output, noise_predictor_outputs,
+            output_path / "noise_outputs", img_name,
+            h_end if pad_h > 0 or pad_w > 0 else None,
+            w_end if pad_h > 0 or pad_w > 0 else None
         )
 
         print(f"  ✓ 可视化结果保存到: {output_path}")
 
-    def _create_comparison_figure(self, lr_image, lr_upsampled,
-                                  images_a, images_b, output_file):
+    def _latent_to_image(self, latent):
+        """将潜在表示转换为图像（用于可视化模型输出）"""
+        with torch.no_grad():
+            img_tensor = self.vae.decode(latent)
+        img_tensor = torch.clamp(img_tensor, -1.0, 1.0)
+        img_tensor = img_tensor * 0.5 + 0.5
+        img = img_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+        return np.clip(img, 0, 1)
+
+    def _create_model_outputs_figure(self, lr_image, lr_upsampled,
+                                    initializer_output, noise_predictor_outputs, output_file,
+                                    h_end=None, w_end=None):
         """
-        创建对比图表
+        创建Initializer和NoisePredictor输出可视化图
 
         Args:
             lr_image: 原始LR图像
             lr_upsampled: 上采样的LR图像
-            images_a: 模式A的中间状态图像列表
-            images_b: 模式B的中间状态图像列表
+            initializer_output: Initializer的输出（初始噪声）
+            noise_predictor_outputs: NoisePredictor在每一步的输出列表
             output_file: 输出文件路径
+            h_end: 图像高度结束位置（去除padding后）
+            w_end: 图像宽度结束位置（去除padding后）
         """
-        num_steps = len(images_a)  # 包括初始状态，所以是num_steps + 1
+        num_steps = len(noise_predictor_outputs)
 
         # 创建图表
-        # 行：LR | 模式A | 模式B
-        # 列：LR/初始状态 | 步骤1 | 步骤2 | ... | 最终结果
-        fig = plt.figure(figsize=(4 * (num_steps + 1), 4 * 3))
-        gs = gridspec.GridSpec(3, num_steps + 1, figure=fig, wspace=0.05, hspace=0.1)
+        # 2行：第一行显示输入图像，第二行显示模型输出
+        fig_width = 3.0 * (num_steps + 2)
+        fig_height = 3.0 * 2
+        fig = plt.figure(figsize=(fig_width, fig_height))
+        gs = gridspec.GridSpec(2, num_steps + 2, figure=fig, wspace=0.05, hspace=0.1)
 
-        # 第一行：LR图像和上采样图像
+        # 第一行：输入图像
         ax = fig.add_subplot(gs[0, 0])
         ax.imshow(lr_image)
         ax.set_title('LR Input', fontsize=10)
@@ -606,90 +663,89 @@ class IntermediateStepVisualizer:
         ax.set_title('Bicubic Upsampled', fontsize=10)
         ax.axis('off')
 
-        # 填充第一行剩余位置
-        for j in range(2, num_steps + 1):
+        # 第一行中间留空或显示最终结果
+        for j in range(2, num_steps + 2):
             ax = fig.add_subplot(gs[0, j])
             ax.axis('off')
 
-        # 行标签
-        row_labels = [
-            'Input',
-            'Mode A\n(Random Init +\nRandom Noise)',
-            'Mode B\n(Random Init +\nPredictor)'
-        ]
+        # 第二行：Initializer和NoisePredictor输出
+        # 显示Initializer输出（初始噪声的可视化）
+        initializer_img = self._latent_to_image(initializer_output)
+        if h_end is not None and w_end is not None:
+            initializer_img = initializer_img[:h_end, :w_end]
+        ax = fig.add_subplot(gs[1, 0])
+        ax.imshow(initializer_img)
+        ax.set_title('Initializer\nOutput\n(Initial Noise)', fontsize=10)
+        ax.axis('off')
 
-        # 列标签
-        col_labels = ['Initial (x_T)'] + [f'Step {i + 1}' for i in range(num_steps - 1)] + ['Final (x_0)']
+        # 显示NoisePredictor在关键步骤的输出
+        # 采样关键步骤：开始、中间、结束
+        key_indices = []
+        if num_steps >= 3:
+            key_indices = [0, num_steps // 2, num_steps - 1]
+        else:
+            key_indices = list(range(num_steps))
 
-        # 模式A
-        for j, img in enumerate(images_a):
-            ax = fig.add_subplot(gs[1, j])
-            ax.imshow(np.clip(img, 0, 1))
-            if j == 0:
-                ax.set_ylabel(row_labels[1], fontsize=9)
-            ax.set_title(col_labels[j], fontsize=9)
+        for idx, step_idx in enumerate(key_indices):
+            col = idx + 1
+            noise_output = noise_predictor_outputs[step_idx]
+            noise_img = self._latent_to_image(noise_output)
+            if h_end is not None and w_end is not None:
+                noise_img = noise_img[:h_end, :w_end]
+
+            ax = fig.add_subplot(gs[1, col])
+            ax.imshow(noise_img)
+            step_num = num_steps - step_idx
+            ax.set_title(f'NoisePredictor\nStep {step_num}', fontsize=10)
             ax.axis('off')
 
-        # 模式B
-        for j, img in enumerate(images_b):
-            ax = fig.add_subplot(gs[2, j])
-            ax.imshow(np.clip(img, 0, 1))
-            if j == 0:
-                ax.set_ylabel(row_labels[2], fontsize=9)
-            ax.axis('off')
-
-        plt.suptitle('Intermediate Steps Comparison\n(Reverse Diffusion Process)',
+        plt.suptitle('Initializer and NoisePredictor Outputs Visualization',
                      fontsize=14, y=0.98)
         plt.tight_layout()
+        plt.subplots_adjust(top=0.93)
         plt.savefig(str(output_file), dpi=150, bbox_inches='tight')
         plt.close()
 
-        print(f"    保存对比图: {output_file}")
+        print(f"    保存可视化图: {output_file}")
 
-    def _save_individual_images(self, images_a, images_b, output_path, img_name):
+    def _save_noise_images(self, initializer_output, noise_predictor_outputs,
+                          output_dir, img_name, h_end=None, w_end=None):
         """
-        保存单独的中间状态图像
+        保存初始噪声图和每一步的中间噪声图
 
         Args:
-            images_a: 模式A的中间状态图像列表
-            images_b: 模式B的中间状态图像列表
-            output_path: 输出目录
+            initializer_output: Initializer的输出（初始噪声）
+            noise_predictor_outputs: NoisePredictor在每一步的输出列表
+            output_dir: 输出目录
             img_name: 图像名称
+            h_end: 图像高度结束位置（去除padding后）
+            w_end: 图像宽度结束位置（去除padding后）
         """
-        # 创建子目录
-        mode_a_dir = output_path / "mode_a_random_random"
-        mode_b_dir = output_path / "mode_b_random_predictor"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        mode_a_dir.mkdir(parents=True, exist_ok=True)
-        mode_b_dir.mkdir(parents=True, exist_ok=True)
+        # 保存Initializer输出的初始噪声图
+        initializer_img = self._latent_to_image(initializer_output)
+        if h_end is not None and w_end is not None:
+            initializer_img = initializer_img[:h_end, :w_end]
 
-        # 保存模式A的图像
-        for i, img in enumerate(images_a):
-            if i == 0:
-                step_name = "initial_xT"
-            elif i == len(images_a) - 1:
-                step_name = "final_x0"
-            else:
-                step_name = f"step_{i}"
+        img_uint8 = (np.clip(initializer_img, 0, 1) * 255).astype(np.uint8)
+        img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(str(output_dir / f"{img_name}_initializer_initial_noise.png"), img_bgr)
 
-            img_uint8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+        # 保存NoisePredictor在每一步的输出
+        num_steps = len(noise_predictor_outputs)
+        for i, noise_output in enumerate(noise_predictor_outputs):
+            noise_img = self._latent_to_image(noise_output)
+            if h_end is not None and w_end is not None:
+                noise_img = noise_img[:h_end, :w_end]
+
+            step_num = num_steps - i
+            img_uint8 = (np.clip(noise_img, 0, 1) * 255).astype(np.uint8)
             img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(mode_a_dir / f"{img_name}_{step_name}.png"), img_bgr)
+            cv2.imwrite(str(output_dir / f"{img_name}_noisepredictor_step{step_num}.png"), img_bgr)
 
-        # 保存模式B的图像
-        for i, img in enumerate(images_b):
-            if i == 0:
-                step_name = "initial_xT"
-            elif i == len(images_b) - 1:
-                step_name = "final_x0"
-            else:
-                step_name = f"step_{i}"
-
-            img_uint8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
-            img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(mode_b_dir / f"{img_name}_{step_name}.png"), img_bgr)
-
-        print(f"    保存单独图像到: {mode_a_dir}, {mode_b_dir}")
+        print(f"    保存噪声图像到: {output_dir}")
 
     def run(self, input_path, output_path):
         """
@@ -714,14 +770,14 @@ class IntermediateStepVisualizer:
         print(f"\n找到 {len(image_paths)} 张图像")
 
         # 处理每张图像
-        for img_path in tqdm(image_paths, desc="可视化中间状态"):
+        for img_path in tqdm(image_paths, desc="可视化模型输出"):
             self.visualize_intermediate_steps(img_path, output_path)
 
         print(f"\n✓ 全部完成！结果保存在: {output_path}")
 
 
 def get_parser():
-    parser = argparse.ArgumentParser(description="中间状态可视化脚本")
+    parser = argparse.ArgumentParser(description="Initializer和NoisePredictor输出可视化脚本")
     parser.add_argument(
         "-i", "--input",
         type=str,
@@ -762,15 +818,18 @@ def main():
         args.device = 'cpu'
 
     print("=" * 60)
-    print("中间状态可视化脚本")
+    print("Initializer和NoisePredictor输出可视化脚本")
     print("=" * 60)
-    print("\n两种模式说明：")
-    print("  模式A: 随机噪声初始化 + 随机噪声采样（原始ResShift）")
-    print("  模式B: 随机噪声初始化 + 噪声预测器采样")
+    print("\n可视化内容：")
+    print("  1. Initializer输出：生成初始噪声预测（用于x_T初始化）")
+    print("  2. NoisePredictor输出：在反向扩散过程中生成每一步的噪声预测")
+    print("\n说明：")
+    print("  Initializer和NoisePredictor都是基于UNet结构的深度学习模型")
+    print("  它们学习预测噪声，用于引导反向扩散过程")
     print("=" * 60)
 
     # 初始化可视化器
-    visualizer = IntermediateStepVisualizer(args.config, device=args.device)
+    visualizer = ModelOutputsVisualizer(args.config, device=args.device)
 
     # 执行可视化
     visualizer.run(args.input, args.output)

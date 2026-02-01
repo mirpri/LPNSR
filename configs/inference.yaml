@@ -2,7 +2,6 @@ model:
   noise_predictor_path: "LPNSR/pretrained/noise_predictor.pth"
   resshift_path: "LPNSR/pretrained/resshift_realsrx4_s4_v3.pth"
   vae_path: "LPNSR/pretrained/autoencoder_vq_f4.pth"
-  initializer_path: "LPNSR/pretrained/initializer.pth"
 
 vae:
   lora:
@@ -36,9 +35,6 @@ resshift_unet:
 noise_predictor:
   config_path: "LPNSR/configs/noise_predictor_config.yaml"
 
-initializer:
-  config_path: "LPNSR/configs/initializer_config.yaml"
-
 diffusion:
   num_timesteps: 4
   kappa: 2.0
@@ -55,7 +51,7 @@ inference:
   scale_factor: 4
 
   use_noise_predictor: true
-  use_initializer: true
+  use_swinir: true
 
   color_correction: true
 
@@ -71,3 +67,14 @@ inference:
 
   save_format: "png"
   rgb2bgr: true
+
+  swinir:
+    model_path: "LPNSR/pretrained/003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth"
+    img_size: 64
+    window_size: 8
+    depths: [6, 6, 6, 6, 6, 6, 6, 6, 6]
+    embed_dim: 240
+    num_heads: [8, 8, 8, 8, 8, 8, 8, 8, 8]
+    mlp_ratio: 2
+    upsampler: "nearest+conv"
+    resi_connection: "3conv"

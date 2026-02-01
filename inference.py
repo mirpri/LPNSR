@@ -35,9 +35,9 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 # LPNSR模块导入
 from LPNSR.models.noise_predictor import create_noise_predictor
-from LPNSR.models.initializer import create_initializer
 from LPNSR.models.unet import UNetModelSwin
 from LPNSR.ldm.models.autoencoder import VQModelTorch
+from LPNSR.models.swinir_sr import create_swinir, SwinIRWrapper
 
 
 def get_named_eta_schedule(
@@ -248,21 +248,21 @@ class NoisePredictorInference:
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-        # 推理配置（需要在初始化扩散参数之前设置）
+        # 推理配置（需要在初始化模型之前设置）
         self.num_steps = self.config['inference']['num_steps']
-
-        # 初始化模型
-        self._init_models()
-
-        # 初始化扩散参数
-        self._init_diffusion()
         self.scale_factor = self.config['inference']['scale_factor']
         self.chop_size = self.config['inference']['chop_size']
         self.chop_stride = self.config['inference']['chop_stride']
         self.chop_bs = self.config['inference']['chop_bs']
         self.use_amp = self.config['inference']['use_amp']
         self.use_noise_predictor = self.config['inference'].get('use_noise_predictor', True)
-        self.use_initializer = self.config['inference'].get('use_initializer', True)
+        self.use_swinir = self.config['inference'].get('use_swinir', True)
+
+        # 初始化模型
+        self._init_models()
+
+        # 初始化扩散参数
+        self._init_diffusion()
 
         # 颜色校正配置（解决超分后图像颜色偏移问题）
         self.color_correction = self.config['inference'].get('color_correction', True)
@@ -273,8 +273,8 @@ class NoisePredictorInference:
         print(f"  - Chop尺寸: {self.chop_size}x{self.chop_size}")
         print(f"  - Chop步长: {self.chop_stride}")
         print(f"  - 颜色校正: {'启用' if self.color_correction else '禁用'}")
-        print(f"  - 初始化器: {'启用' if self.use_initializer  else '禁用'}")
         print(f"  - 噪声预测器: {'启用' if self.use_noise_predictor else '禁用'}")
+        print(f"  - SwinIR超分: {'启用' if self.swinir else '禁用'}")
 
     def _init_models(self):
         """初始化模型"""
@@ -427,51 +427,37 @@ class NoisePredictorInference:
             param.requires_grad = False
         print("  ✓ 噪声预测器加载完成")
 
-        # 4. 加载初始化器
-        self.initializer = None
-        if self.config['model'].get('initializer_path') and self.config.get('initializer'):
-            print("  加载初始化器...")
-            initializer_config = self.config['initializer']
+        # 4. 加载SwinIR超分模型（可选）
+        self.swinir = None
+        if self.config['inference'].get('use_swinir', False):
+            print("  加载SwinIR超分模型...")
+            swinir_config = self.config['inference'].get('swinir', {})
 
-            # 如果指定了配置文件路径，则加载配置
-            if 'config_path' in initializer_config:
-                with open(initializer_config['config_path'], 'r', encoding='utf-8') as f:
-                    config = yaml.safe_load(f)
-                # 使用配置文件中的参数
-                self.initializer = create_initializer(
-                    latent_channels=config['latent_channels'],
-                    model_channels=config['model_channels'],
-                    channel_mult=tuple(config['channel_mult']),
-                    num_res_blocks=config['num_res_blocks'],
-                    growth_rate=config['growth_rate'],
-                    res_scale=config['res_scale'],
-                    double_z=config['double_z']
-                )
-            else:
-                # 使用直接指定的参数
-                self.initializer = create_initializer(
-                    latent_channels=initializer_config['latent_channels'],
-                    model_channels=initializer_config['model_channels'],
-                    channel_mult=tuple(initializer_config['channel_mult']),
-                    num_res_blocks=initializer_config['num_res_blocks'],
-                    growth_rate=initializer_config.get('growth_rate', 32),
-                    res_scale=initializer_config.get('res_scale', 0.1),
-                    double_z=initializer_config.get('double_z', True)
-                )
+            # SwinIR模型路径
+            swinir_model_path = swinir_config.get('model_path',
+                self.config['model'].get('swinir_path', 'LPNSR/pretrained/003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth'))
 
-            # 加载权重
-            initializer_ckpt = torch.load(self.config['model']['initializer_path'], map_location='cpu')
-            state_dict = initializer_ckpt
-            print(f"  从initializer.pth加载（仅权重）")
+            # 创建SwinIR模型
+            swinir_model = create_swinir(
+                upscale=self.scale_factor,
+                img_size=swinir_config.get('img_size', 64),
+                window_size=swinir_config.get('window_size', 8),
+                img_range=1.0,
+                depths=swinir_config.get('depths', [6, 6, 6, 6, 6, 6]),
+                embed_dim=swinir_config.get('embed_dim', 180),
+                num_heads=swinir_config.get('num_heads', [6, 6, 6, 6, 6, 6]),
+                mlp_ratio=swinir_config.get('mlp_ratio', 2),
+                upsampler=swinir_config.get('upsampler', 'nearest+conv'),
+                resi_connection=swinir_config.get('resi_connection', '1conv'),
+                model_path=swinir_model_path,
+                device=self.device
+            )
 
-            self.initializer.load_state_dict(state_dict, strict=True)
-            self.initializer = self.initializer.to(self.device)
-            self.initializer.eval()
-            for param in self.initializer.parameters():
-                param.requires_grad = False
-            print("  ✓ 初始化器加载完成")
+            # 使用包装器处理数据范围转换
+            self.swinir = SwinIRWrapper(swinir_model)
+            print("  ✓ SwinIR超分模型加载完成")
         else:
-            print("  初始化器未启用（未找到配置或权重路径）")
+            print("  SwinIR超分模型未启用")
 
     def _init_diffusion(self):
         """
@@ -487,7 +473,6 @@ class NoisePredictorInference:
         self.kappa = diffusion_config['kappa']
         self.normalize_input = diffusion_config.get('normalize_input', True)
         self.latent_flag = diffusion_config.get('latent_flag', True)
-        self.scale_factor = diffusion_config.get('scale_factor', 1.0)
 
         # 计算eta调度（直接用num_timesteps步）
         sqrt_etas = get_named_eta_schedule(
@@ -706,16 +691,19 @@ class NoisePredictorInference:
         Returns:
             sr_tensor: SR图像 (B, C, H*sf, W*sf), [-1, 1], RGB
         """
-        # 调试：检查输入范围
-        # print(f"  [Debug] lr_tensor: min={lr_tensor.min().item():.3f}, max={lr_tensor.max().item():.3f}")
 
         # 1. 上采样LR图像
-        lr_upsampled = F.interpolate(
-            lr_tensor,
-            scale_factor=self.scale_factor,
-            mode='bicubic',
-            align_corners=False
-        )
+        if self.swinir is not None and self.use_swinir:
+            # 使用SwinIR进行超分
+            lr_upsampled = self.swinir(lr_tensor)
+        else:
+            # 使用双三次插值
+            lr_upsampled = F.interpolate(
+                lr_tensor,
+                scale_factor=self.scale_factor,
+                mode='bicubic',
+                align_corners=False
+            )
 
         # 2. 编码到潜在空间
         with torch.no_grad():
@@ -751,15 +739,8 @@ class NoisePredictorInference:
         # 使用最后一个时间步（即num_steps-1，对应原始的最大时间步）
         t = torch.tensor([self.num_steps - 1] * y.shape[0], device=self.device).long()
 
-        if noise is None:
-            # 选择初始化方式
-            if self.initializer is not None and self.use_initializer:
-                # 使用initializer生成初始噪声
-                # initializer: (lr_latent, timesteps) -> noise
-                noise = self.initializer(y, t, sample_posterior=True)
-            else:
-                # 使用随机高斯噪声（原始ResShift）
-                noise = torch.randn_like(y)
+        # 使用随机高斯噪声（原始ResShift）
+        noise = torch.randn_like(y)
 
         return y + self._extract_into_tensor(self.kappa * self.sqrt_etas, t, y.shape) * noise
 
@@ -1023,9 +1004,9 @@ def get_parser():
         help="禁用噪声预测器，使用随机噪声（原始ResShift方式）"
     )
     parser.add_argument(
-        "--disable_initializer",
+        "--disable_swinir",
         action="store_true",
-        help="禁用初始化器，使用随机噪声初始化"
+        help="禁用SwinIR超分模型"
     )
 
     return parser
@@ -1056,13 +1037,15 @@ def main():
     # 覆盖噪声模式
     if args.disable_noise_predictor:
         inferencer.use_noise_predictor = False
-    if args.disable_initializer:
-        inferencer.use_initializer = False
 
-    # 打印最终的噪声策略
+    if args.disable_swinir:
+        inferencer.use_swinir = False
+
+    # 打印最终的推理策略
     print(f"\n推理策略:")
-    print(f"  - 初始化(x_T): {'初始化器' if inferencer.use_initializer  else '随机高斯噪声'}")
+    print(f"  - 初始化(x_T): 随机高斯噪声")
     print(f"  - 中间采样: {'噪声预测器' if inferencer.use_noise_predictor else '随机高斯噪声'}")
+    print(f"  - 上采样: {'SwinIR' if inferencer.use_swinir else '双三次插值'}")
 
     # 执行推理
     inferencer.inference(args.input, args.output)
