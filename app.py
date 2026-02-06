@@ -41,7 +41,7 @@ def initialize_inference(device='cuda', num_steps=4, color_correction=True):
     return "✓ Model loaded successfully!"
 
 
-def process_image(input_image, num_steps, color_correction, use_initializer, use_noise_predictor, seed):
+def process_image(input_image, num_steps, color_correction, use_swinir, use_noise_predictor, seed):
     """Process a single image for super-resolution"""
     global inference_engine
 
@@ -52,7 +52,7 @@ def process_image(input_image, num_steps, color_correction, use_initializer, use
     # Update settings
     inference_engine.num_steps = num_steps
     inference_engine.color_correction = color_correction
-    inference_engine.use_initializer = use_initializer
+    inference_engine.use_swinir = use_swinir
     inference_engine.use_noise_predictor = use_noise_predictor
 
     # Convert seed to int
@@ -88,7 +88,7 @@ def process_image(input_image, num_steps, color_correction, use_initializer, use
     return str(output_path), str(output_path)
 
 
-def process_batch(input_dir, output_dir, num_steps, color_correction, use_initializer, use_noise_predictor, seed):
+def process_batch(input_dir, output_dir, num_steps, color_correction, use_swinir, use_noise_predictor, seed):
     """Process a batch of images"""
     global inference_engine
 
@@ -99,7 +99,7 @@ def process_batch(input_dir, output_dir, num_steps, color_correction, use_initia
     # Update settings
     inference_engine.num_steps = num_steps
     inference_engine.color_correction = color_correction
-    inference_engine.use_initializer = use_initializer
+    inference_engine.use_swinir = use_swinir
     inference_engine.use_noise_predictor = use_noise_predictor
 
     # Convert seed to int
@@ -156,20 +156,21 @@ title = "LPNSR: Image Super-resolution via Latent Proximal Noise Sampling"
 
 description = r"""
 <b>Official Gradio Demo</b> for <b>LPNSR</b> (Latent Proximal Noise Sampling for Image Super-resolution).<br>
-🔥 LPNSR achieves state-of-the-art image super-resolution results with advanced noise prediction and initialization techniques.<br>
+🔥 LPNSR achieves state-of-the-art image super-resolution results with advanced noise prediction and SwinIR-based super-resolution.<br>
 """
 
 article = r"""
 📋 **Features**
 - High-quality 4x image super-resolution
 - Advanced noise prediction for better detail reconstruction
-- Intelligent initializer for faster convergence
+- SwinIR-based super-resolution for high-quality baseline
 - Color correction for natural-looking results
 - Batch processing support
 
 💡 **Tips**
 - Upload a low-resolution image to see the super-resolution result
 - Adjust the number of steps (1-4) for quality vs. speed trade-off
+- Enable SwinIR for better baseline quality
 - Enable color correction for natural colors
 - Use batch processing to process multiple images at once
 
@@ -202,9 +203,9 @@ with gr.Blocks() as demo:
                         value=True,
                         label="Enable Color Correction"
                     )
-                    use_initializer = gr.Checkbox(
+                    use_swinir = gr.Checkbox(
                         value=True,
-                        label="Enable Initializer"
+                        label="Enable SwinIR Super-resolution"
                     )
                     use_noise_predictor = gr.Checkbox(
                         value=True,
@@ -227,7 +228,7 @@ with gr.Blocks() as demo:
 
             process_btn.click(
                 fn=process_image,
-                inputs=[input_image, num_steps, color_correction, use_initializer, use_noise_predictor, seed],
+                inputs=[input_image, num_steps, color_correction, use_swinir, use_noise_predictor, seed],
                 outputs=[output_image, output_file]
             )
 
@@ -252,9 +253,9 @@ with gr.Blocks() as demo:
                     value=True,
                     label="Enable Color Correction"
                 )
-                batch_use_initializer = gr.Checkbox(
+                batch_use_swinir = gr.Checkbox(
                     value=True,
-                    label="Enable Initializer"
+                    label="Enable SwinIR Super-resolution"
                 )
                 batch_use_noise_predictor = gr.Checkbox(
                     value=True,
@@ -272,7 +273,7 @@ with gr.Blocks() as demo:
 
             batch_btn.click(
                 fn=process_batch,
-                inputs=[input_dir, output_dir, batch_num_steps, batch_color_correction, batch_use_initializer, batch_use_noise_predictor, batch_seed],
+                inputs=[input_dir, output_dir, batch_num_steps, batch_color_correction, batch_use_swinir, batch_use_noise_predictor, batch_seed],
                 outputs=batch_status
             )
 

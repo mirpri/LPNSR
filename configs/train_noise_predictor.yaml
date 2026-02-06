@@ -60,7 +60,7 @@ loss:
   disc_n_layers: 3
   disc_norm_type: 'spectral'
   disc_lr: 5.0e-5
-  disc_start_epoch: 0
+  disc_start_epoch: 2
   disc_update_freq: 2
 
 optimizer:

@@ -651,7 +651,7 @@ class NoisePredictorTrainer:
                 mean, variance, log_variance = self.q_posterior_mean_variance(pred_x0, x_t, t_tensor)
 
                 # 使用噪声预测器预测噪声（需要梯度）
-                predicted_noise = self.noise_predictor(x_t, z_y, t_tensor, sample_posterior=True)
+                predicted_noise = self.noise_predictor(x_t, lr_image, t_tensor, sample_posterior=True)
 
                 # 采样 x_{t-1}
                 # nonzero_mask 在这里总是 1，因为 i > 0

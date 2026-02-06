@@ -785,8 +785,7 @@ class NoisePredictorInference:
             # 根据use_noise_predictor选择中间采样的噪声来源
             if self.use_noise_predictor:
                 # 使用噪声预测器预测噪声
-                # EDSR-Unet噪声预测器需要(z_t, lr_latent, timestep)作为输入
-                noise = self.noise_predictor(x_t, lr_latent, t_tensor, sample_posterior=True)
+                noise = self.noise_predictor(x_t, lr_image, t_tensor, sample_posterior=True)
             else:
                 # 使用随机高斯噪声
                 noise = torch.randn_like(x_t)

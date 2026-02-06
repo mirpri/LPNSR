@@ -10,8 +10,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import cv2
 from typing import Union, Tuple
-from scipy.ndimage import uniform_filter
 from .metric_utils import reorder_image, to_y_channel
 
 
@@ -23,24 +23,28 @@ def _ssim_single_channel(
     win_size: int = 11,
     data_range: float = 255.0
 ) -> float:
-    """Calculate SSIM value for single-channel image"""
+    """Calculate SSIM value for single-channel image using Gaussian weighting"""
     c1 = (k1 * data_range) ** 2
     c2 = (k2 * data_range) ** 2
-    
-    mu1 = uniform_filter(img1, size=win_size, mode='reflect')
-    mu2 = uniform_filter(img2, size=win_size, mode='reflect')
-    
+
+    # Create Gaussian kernel with sigma=1.5 (standard implementation)
+    kernel = cv2.getGaussianKernel(win_size, 1.5)
+    window = np.outer(kernel, kernel.transpose())
+
+    mu1 = cv2.filter2D(img1, -1, window)[win_size//2:-win_size//2, win_size//2:-win_size//2]
+    mu2 = cv2.filter2D(img2, -1, window)[win_size//2:-win_size//2, win_size//2:-win_size//2]
+
     mu1_sq = mu1 ** 2
     mu2_sq = mu2 ** 2
     mu1_mu2 = mu1 * mu2
-    
-    sigma1_sq = uniform_filter(img1 ** 2, size=win_size, mode='reflect') - mu1_sq
-    sigma2_sq = uniform_filter(img2 ** 2, size=win_size, mode='reflect') - mu2_sq
-    sigma12 = uniform_filter(img1 * img2, size=win_size, mode='reflect') - mu1_mu2
-    
+
+    sigma1_sq = cv2.filter2D(img1 ** 2, -1, window)[win_size//2:-win_size//2, win_size//2:-win_size//2] - mu1_sq
+    sigma2_sq = cv2.filter2D(img2 ** 2, -1, window)[win_size//2:-win_size//2, win_size//2:-win_size//2] - mu2_sq
+    sigma12 = cv2.filter2D(img1 * img2, -1, window)[win_size//2:-win_size//2, win_size//2:-win_size//2] - mu1_mu2
+
     ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / \
                ((mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2))
-    
+
     return float(ssim_map.mean())
 
 

@@ -1,13 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-中间状态可视化脚本
+中间步骤可视化脚本
 
 功能：
-1. 可视化Initializer和NoisePredictor的输出
-2. Initializer输出：生成初始噪声预测（用于x_T初始化）
-3. NoisePredictor输出：在反向扩散过程中生成每一步的噪声预测
-4. 帮助分析初始化器和噪声预测器的工作原理
+1. 可视化SWINIR超分后的图像（作为初始上采样）
+2. 可视化最终超分结果
+3. 可视化NoisePredictor预测的噪声图（每一步的噪声预测）
+4. 帮助分析噪声预测器的工作原理
+
+注意：
+- SWINIR只在开始时调用一次，用于初始上采样（替代bicubic插值）
+- 噪声预测器在每一步都被调用，用于生成精确的噪声
 """
 
 import os
@@ -37,7 +41,6 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 # LPNSR模块导入
 from LPNSR.models.noise_predictor import create_noise_predictor
-from LPNSR.models.initializer import create_initializer
 from LPNSR.models.unet import UNetModelSwin
 from LPNSR.ldm.models.autoencoder import VQModelTorch
 
@@ -84,7 +87,7 @@ def get_named_eta_schedule(
 
 
 class ModelOutputsVisualizer:
-    """Initializer和NoisePredictor输出可视化类"""
+    """超分中间步骤可视化类"""
 
     def __init__(self, config_path, device='cuda'):
         """
@@ -105,24 +108,27 @@ class ModelOutputsVisualizer:
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-        # 推理配置（需要在初始化扩散参数之前设置）
+        # 推理配置（需要在初始化模型之前设置）
         self.num_steps = self.config['inference']['num_steps']
+        self.scale_factor = self.config['inference']['scale_factor']
+        self.use_amp = self.config['inference']['use_amp']
 
         # 初始化模型
         self._init_models()
 
         # 初始化扩散参数
         self._init_diffusion()
-        self.scale_factor = self.config['inference']['scale_factor']
-        self.use_amp = self.config['inference']['use_amp']
 
         # 颜色校正配置
         self.color_correction = self.config['inference'].get('color_correction', True)
 
+        # 上采样方式配置
+        self.use_swinir = self.config['inference'].get('use_swinir', False)
+
         print(f"✓ 可视化器初始化完成")
         print(f"  - 采样步数: {self.num_steps}")
         print(f"  - 超分倍数: {self.scale_factor}x")
-        print(f"  - Initializer: {'已加载' if self.initializer is not None else '未加载'}")
+        print(f"  - 上采样方式: {'SWINIR' if self.swinir is not None else 'Bicubic'}")
 
     def _init_models(self):
         """初始化模型"""
@@ -263,55 +269,38 @@ class ModelOutputsVisualizer:
             param.requires_grad = False
         print("  ✓ 噪声预测器加载完成")
 
-        # 4. 加载Initializer
-        print("  加载Initializer...")
-        if self.config['inference'].get('use_initializer', False) and 'initializer_path' in self.config['model']:
-            initializer_config = self.config['initializer']
 
-            if 'config_path' in initializer_config:
-                with open(initializer_config['config_path'], 'r', encoding='utf-8') as f:
-                    init_config = yaml.safe_load(f)
-                self.initializer = create_initializer(
-                    latent_channels=init_config['latent_channels'],
-                    model_channels=init_config['model_channels'],
-                    channel_mult=tuple(init_config['channel_mult']),
-                    num_res_blocks=init_config['num_res_blocks'],
-                    growth_rate=init_config['growth_rate'],
-                    res_scale=init_config['res_scale'],
-                    double_z=init_config['double_z']
-                )
-            else:
-                self.initializer = create_initializer(
-                    latent_channels=initializer_config['latent_channels'],
-                    model_channels=initializer_config['model_channels'],
-                    channel_mult=tuple(initializer_config['channel_mult']),
-                    num_res_blocks=initializer_config['num_res_blocks'],
-                    growth_rate=initializer_config.get('growth_rate', 32),
-                    res_scale=initializer_config.get('res_scale', 0.1),
-                    double_z=initializer_config.get('double_z', True)
-                )
+        # 5. 加载SWINIR超分模型（可选）
+        self.swinir = None
+        if self.config['inference'].get('use_swinir', False):
+            print("  加载SWINIR超分模型...")
+            from LPNSR.models.swinir_sr import create_swinir, SwinIRWrapper
 
-            init_ckpt = torch.load(self.config['model']['initializer_path'], map_location='cpu')
+            swinir_config = self.config['inference'].get('swinir', {})
 
-            if isinstance(init_ckpt, dict):
-                if 'initializer_state_dict' in init_ckpt:
-                    state_dict = init_ckpt['initializer_state_dict']
-                elif 'model_state_dict' in init_ckpt:
-                    state_dict = init_ckpt['model_state_dict']
-                else:
-                    state_dict = init_ckpt
-            else:
-                state_dict = init_ckpt
+            # SWINIR模型路径
+            swinir_model_path = 'LPNSR/pretrained/003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth'
 
-            self.initializer.load_state_dict(state_dict, strict=True)
-            self.initializer = self.initializer.to(self.device)
-            self.initializer.eval()
-            for param in self.initializer.parameters():
-                param.requires_grad = False
-            print("  ✓ Initializer加载完成")
+            # 创建SWINIR模型
+            swinir_model = create_swinir(
+                upscale=self.scale_factor,
+                img_size=swinir_config.get('img_size', 64),
+                window_size=swinir_config.get('window_size', 8),
+                img_range=swinir_config.get('img_range', 1.0),
+                depths=swinir_config.get('depths', [6, 6, 6, 6, 6, 6]),
+                embed_dim=swinir_config.get('embed_dim', 180),
+                num_heads=swinir_config.get('num_heads', [6, 6, 6, 6, 6, 6]),
+                mlp_ratio=swinir_config.get('mlp_ratio', 2),
+                upsampler=swinir_config.get('upsampler', 'pixelshuffle'),
+                resi_connection=swinir_config.get('resi_connection', '1conv'),
+                model_path=swinir_model_path,
+                device=self.device
+            )
+            # 使用包装器处理数据范围转换
+            self.swinir = SwinIRWrapper(swinir_model)
+            print("  ✓ SWINIR加载完成")
         else:
-            self.initializer = None
-            print("  ! Initializer未配置，模式C和模式D将不可用")
+            print("  ! SWINIR未配置或未启用，将使用bicubic插值")
 
     def _init_diffusion(self):
         """初始化扩散参数"""
@@ -419,6 +408,25 @@ class ModelOutputsVisualizer:
         noise = self.initializer(y, t, sample_posterior=True)
         return y + self._extract_into_tensor(self.kappa * self.sqrt_etas, t, y.shape) * noise
 
+    def prior_sample(self, y, t=None):
+        """
+        从先验分布采样，即 q(x_T|y) ~= N(x_T|y, κ²η_T)
+
+        Args:
+            y: 退化图像的潜在表示（lr_latent）
+            t: 可选的时间步，默认使用最后一个时间步
+
+        Returns:
+            x_T: 初始采样
+        """
+        if t is None:
+            t = torch.tensor([self.num_steps - 1] * y.shape[0], device=y.device).long()
+
+        # 使用随机高斯噪声
+        noise = torch.randn_like(y)
+
+        return y + self._extract_into_tensor(self.kappa * self.sqrt_etas, t, y.shape) * noise
+
     def _wavelet_blur(self, image: torch.Tensor, radius: int):
         """对输入tensor应用小波模糊"""
         kernel_vals = [
@@ -466,34 +474,29 @@ class ModelOutputsVisualizer:
         return img
 
     @torch.no_grad()
-    def reverse_sampling_with_outputs(self, lr_latent, lr_image):
+    def reverse_sampling_with_outputs(self, lr_latent, lr_image, lr_upsampled):
         """
-        反向采样过程，收集Initializer和NoisePredictor的输出
+        反向采样过程，收集NoisePredictor的输出
 
         Args:
             lr_latent: LR图像的潜在表示
             lr_image: 图像空间的LR图像（用作UNet的lq条件）
+            lr_upsampled: SWINIR或bicubic上采样的HR图像
 
         Returns:
-            initializer_output: Initializer的输出（初始噪声）
             noise_predictor_outputs: NoisePredictor在每一步的输出列表
-            intermediate_images: 每一步的中间状态图像列表
+            intermediate_latents: 每一步的中间潜在表示列表
+            final_sr_image: 最终的超分图像
         """
         noise_predictor_outputs = []
-        intermediate_images = []
+        intermediate_latents = []
 
-        # 使用Initializer生成初始噪声
+        # 初始化x_T (使用先验采样)
         t_T = torch.tensor([self.num_steps - 1] * lr_latent.shape[0], device=self.device).long()
-        if self.initializer is not None:
-            initializer_output = self.initializer(lr_latent, t_T, sample_posterior=True)
-        else:
-            initializer_output = torch.randn_like(lr_latent)
+        x_t = self.prior_sample(lr_latent, t_T)
 
-        # 初始化x_T
-        x_t = lr_latent + self._extract_into_tensor(self.kappa * self.sqrt_etas, t_T, lr_latent.shape) * initializer_output
-
-        # 保存初始状态 (x_T)
-        intermediate_images.append(self.latent_to_image(x_t))
+        # 保存初始潜在状态
+        intermediate_latents.append(x_t.clone())
 
         # 反向采样：从num_steps-1到0
         indices = list(range(self.num_steps))[::-1]
@@ -511,17 +514,21 @@ class ModelOutputsVisualizer:
             mean, variance, log_variance = self.q_posterior_mean_variance(pred_x0, x_t, t_tensor)
 
             # 4. 使用NoisePredictor生成噪声
-            noise = self.noise_predictor(x_t, lr_latent, t_tensor, sample_posterior=True)
+            # 注意：noise_predictor现在接受原始图像空间的lr_image[-1,1]，而不是潜空间的lr_latent
+            noise = self.noise_predictor(x_t, lr_image, t_tensor, sample_posterior=True)
             noise_predictor_outputs.append(noise.clone())
 
             # 5. 采样x_{t-1}
             nonzero_mask = (t_tensor != 0).float().view(-1, 1, 1, 1)
             x_t = mean + nonzero_mask * torch.exp(0.5 * log_variance) * noise
 
-            # 保存中间状态
-            intermediate_images.append(self.latent_to_image(x_t))
+            # 保存中间潜在状态
+            intermediate_latents.append(x_t.clone())
 
-        return initializer_output, noise_predictor_outputs, intermediate_images
+        # 6. 解码最终的x_0得到最终图像
+        final_sr_image = self.latent_to_image(x_t)
+
+        return noise_predictor_outputs, intermediate_latents, final_sr_image
 
     def pad_image(self, img, multiple=64):
         """Padding图像到multiple的倍数"""
@@ -536,7 +543,7 @@ class ModelOutputsVisualizer:
 
     def visualize_intermediate_steps(self, lr_image_path, output_path):
         """
-        可视化Initializer和NoisePredictor的输出
+        可视化SWINIR超分结果和NoisePredictor每步的噪声预测
 
         Args:
             lr_image_path: LR图像路径
@@ -559,13 +566,21 @@ class ModelOutputsVisualizer:
         lr_tensor = lr_tensor.to(self.device)
         lr_tensor = lr_tensor * 2.0 - 1.0  # 归一化到[-1, 1]
 
-        # 上采样LR图像
-        lr_upsampled = F.interpolate(
-            lr_tensor,
-            scale_factor=self.scale_factor,
-            mode='bicubic',
-            align_corners=False
-        )
+        # 上采样LR图像（使用SWINIR或bicubic）
+        use_swinir = self.config['inference'].get('use_swinir', False)
+        if use_swinir and hasattr(self, 'swinir') and self.swinir is not None:
+            # 使用SWINIR进行超分
+            lr_upsampled = self.swinir(lr_tensor)
+            print(f"  上采样方法: SWINIR")
+        else:
+            # 使用双三次插值
+            lr_upsampled = F.interpolate(
+                lr_tensor,
+                scale_factor=self.scale_factor,
+                mode='bicubic',
+                align_corners=False
+            )
+            print(f"  上采样方法: Bicubic")
 
         # 编码到潜在空间
         with torch.no_grad():
@@ -573,9 +588,9 @@ class ModelOutputsVisualizer:
 
         print("  开始采样...")
 
-        # 运行反向采样，收集Initializer和NoisePredictor的输出
-        initializer_output, noise_predictor_outputs, intermediate_images = self.reverse_sampling_with_outputs(
-            lr_latent, lr_tensor
+        # 运行反向采样，收集NoisePredictor的输出
+        noise_predictor_outputs, intermediate_latents, final_sr_image = self.reverse_sampling_with_outputs(
+            lr_latent, lr_tensor, lr_upsampled
         )
 
         # 创建输出目录
@@ -585,7 +600,7 @@ class ModelOutputsVisualizer:
         # 获取图像名称
         img_name = Path(lr_image_path).stem
 
-        # 准备LR上采样图像用于显示
+        # 准备LR和上采样图像用于显示
         lr_upsampled_display = lr_upsampled.squeeze(0).permute(1, 2, 0).cpu().numpy()
         lr_upsampled_display = (lr_upsampled_display + 1.0) / 2.0
         lr_upsampled_display = np.clip(lr_upsampled_display, 0, 1)
@@ -595,29 +610,69 @@ class ModelOutputsVisualizer:
             h_end = lr_upsampled_display.shape[0] - pad_h * self.scale_factor
             w_end = lr_upsampled_display.shape[1] - pad_w * self.scale_factor
             lr_upsampled_display = lr_upsampled_display[:h_end, :w_end]
+            final_sr_image = final_sr_image[:h_end, :w_end]
 
-            # 对所有中间状态图像去除padding
-            for i in range(len(intermediate_images)):
-                intermediate_images[i] = intermediate_images[i][:h_end, :w_end]
+        # 创建SWINIR超分结果可视化图
+        self._create_results_figure(
+            lr_image, lr_upsampled_display, final_sr_image,
+            output_path / f"{img_name}_results.png"
+        )
 
-        # 创建可视化图
-        self._create_model_outputs_figure(
-            lr_image, lr_upsampled_display,
-            initializer_output, noise_predictor_outputs,
-            output_path / f"{img_name}_model_outputs.png",
+        # 创建噪声预测器输出可视化图
+        self._create_noise_predictor_figure(
+            noise_predictor_outputs,
+            output_path / f"{img_name}_noise_predictor.png",
             h_end if pad_h > 0 or pad_w > 0 else None,
             w_end if pad_h > 0 or pad_w > 0 else None
         )
 
-        # 保存初始噪声图和每一步的中间噪声图
+        # 保存噪声预测器的输出
         self._save_noise_images(
-            initializer_output, noise_predictor_outputs,
+            noise_predictor_outputs,
             output_path / "noise_outputs", img_name,
             h_end if pad_h > 0 or pad_w > 0 else None,
             w_end if pad_h > 0 or pad_w > 0 else None
         )
 
         print(f"  ✓ 可视化结果保存到: {output_path}")
+
+    def _create_results_figure(self, lr_image, lr_upsampled, final_sr_image, output_file):
+        """
+        创建结果对比可视化图
+
+        Args:
+            lr_image: 原始LR图像
+            lr_upsampled: 上采样的LR图像（SWINIR或bicubic）
+            final_sr_image: 最终的超分结果
+            output_file: 输出文件路径
+        """
+        # 创建图表
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+        axes = axes.flatten()
+
+        # 显示LR图像
+        axes[0].imshow(lr_image)
+        axes[0].set_title('LR Input', fontsize=10)
+        axes[0].axis('off')
+
+        # 显示上采样图像
+        axes[1].imshow(lr_upsampled)
+        axes[1].set_title('Upsampled (Initial)', fontsize=10)
+        axes[1].axis('off')
+
+        # 显示最终SR图像
+        axes[2].imshow(final_sr_image)
+        axes[2].set_title('Final Super-Resolution', fontsize=10)
+        axes[2].axis('off')
+
+        plt.suptitle('Super-Resolution Results Comparison',
+                     fontsize=12, y=0.98)
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.90)
+        plt.savefig(str(output_file), dpi=150, bbox_inches='tight')
+        plt.close()
+
+        print(f"    保存结果对比图: {output_file}")
 
     def _latent_to_image(self, latent):
         """将潜在表示转换为图像（用于可视化模型输出）"""
@@ -628,16 +683,12 @@ class ModelOutputsVisualizer:
         img = img_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
         return np.clip(img, 0, 1)
 
-    def _create_model_outputs_figure(self, lr_image, lr_upsampled,
-                                    initializer_output, noise_predictor_outputs, output_file,
-                                    h_end=None, w_end=None):
+    def _create_noise_predictor_figure(self, noise_predictor_outputs, output_file,
+                                       h_end=None, w_end=None):
         """
-        创建Initializer和NoisePredictor输出可视化图
+        创建噪声预测器输出可视化图
 
         Args:
-            lr_image: 原始LR图像
-            lr_upsampled: 上采样的LR图像
-            initializer_output: Initializer的输出（初始噪声）
             noise_predictor_outputs: NoisePredictor在每一步的输出列表
             output_file: 输出文件路径
             h_end: 图像高度结束位置（去除padding后）
@@ -645,76 +696,45 @@ class ModelOutputsVisualizer:
         """
         num_steps = len(noise_predictor_outputs)
 
+        # 计算网格行列数
+        num_cols = min(8, num_steps)
+        num_rows = (num_steps + num_cols - 1) // num_cols
+
         # 创建图表
-        # 2行：第一行显示输入图像，第二行显示模型输出
-        fig_width = 3.0 * (num_steps + 2)
-        fig_height = 3.0 * 2
+        fig_width = 2.5 * num_cols
+        fig_height = 2.5 * num_rows
         fig = plt.figure(figsize=(fig_width, fig_height))
-        gs = gridspec.GridSpec(2, num_steps + 2, figure=fig, wspace=0.05, hspace=0.1)
+        gs = gridspec.GridSpec(num_rows, num_cols, figure=fig, wspace=0.05, hspace=0.1)
 
-        # 第一行：输入图像
-        ax = fig.add_subplot(gs[0, 0])
-        ax.imshow(lr_image)
-        ax.set_title('LR Input', fontsize=10)
-        ax.axis('off')
-
-        ax = fig.add_subplot(gs[0, 1])
-        ax.imshow(lr_upsampled)
-        ax.set_title('Bicubic Upsampled', fontsize=10)
-        ax.axis('off')
-
-        # 第一行中间留空或显示最终结果
-        for j in range(2, num_steps + 2):
-            ax = fig.add_subplot(gs[0, j])
-            ax.axis('off')
-
-        # 第二行：Initializer和NoisePredictor输出
-        # 显示Initializer输出（初始噪声的可视化）
-        initializer_img = self._latent_to_image(initializer_output)
-        if h_end is not None and w_end is not None:
-            initializer_img = initializer_img[:h_end, :w_end]
-        ax = fig.add_subplot(gs[1, 0])
-        ax.imshow(initializer_img)
-        ax.set_title('Initializer\nOutput\n(Initial Noise)', fontsize=10)
-        ax.axis('off')
-
-        # 显示NoisePredictor在关键步骤的输出
-        # 采样关键步骤：开始、中间、结束
-        key_indices = []
-        if num_steps >= 3:
-            key_indices = [0, num_steps // 2, num_steps - 1]
-        else:
-            key_indices = list(range(num_steps))
-
-        for idx, step_idx in enumerate(key_indices):
-            col = idx + 1
-            noise_output = noise_predictor_outputs[step_idx]
+        # 显示NoisePredictor在每一步的输出
+        for i, noise_output in enumerate(noise_predictor_outputs):
+            row = i // num_cols
+            col = i % num_cols
             noise_img = self._latent_to_image(noise_output)
             if h_end is not None and w_end is not None:
                 noise_img = noise_img[:h_end, :w_end]
 
-            ax = fig.add_subplot(gs[1, col])
+            ax = fig.add_subplot(gs[row, col])
             ax.imshow(noise_img)
-            step_num = num_steps - step_idx
-            ax.set_title(f'NoisePredictor\nStep {step_num}', fontsize=10)
+            step_num = num_steps - i
+            ax.set_title(f'Step {step_num}\nNoise Pred', fontsize=8)
             ax.axis('off')
 
-        plt.suptitle('Initializer and NoisePredictor Outputs Visualization',
-                     fontsize=14, y=0.98)
+        plt.suptitle('NoisePredictor Outputs (Predicted Noise at Each Step)',
+                     fontsize=12, y=0.98)
         plt.tight_layout()
         plt.subplots_adjust(top=0.93)
         plt.savefig(str(output_file), dpi=150, bbox_inches='tight')
         plt.close()
 
-        print(f"    保存可视化图: {output_file}")
+        print(f"    保存噪声预测器可视化图: {output_file}")
 
-    def _save_noise_images(self, initializer_output, noise_predictor_outputs,
-                          output_dir, img_name, h_end=None, w_end=None):
+    def _save_noise_images(self, noise_predictor_outputs, output_dir, img_name,
+                        h_end=None, w_end=None):
         """
-        保存初始噪声图和每一步的中间噪声图
+        保存噪声预测器的输出
 
         Args:
-            initializer_output: Initializer的输出（初始噪声）
             noise_predictor_outputs: NoisePredictor在每一步的输出列表
             output_dir: 输出目录
             img_name: 图像名称
@@ -723,15 +743,6 @@ class ModelOutputsVisualizer:
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-
-        # 保存Initializer输出的初始噪声图
-        initializer_img = self._latent_to_image(initializer_output)
-        if h_end is not None and w_end is not None:
-            initializer_img = initializer_img[:h_end, :w_end]
-
-        img_uint8 = (np.clip(initializer_img, 0, 1) * 255).astype(np.uint8)
-        img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(str(output_dir / f"{img_name}_initializer_initial_noise.png"), img_bgr)
 
         # 保存NoisePredictor在每一步的输出
         num_steps = len(noise_predictor_outputs)
@@ -743,9 +754,10 @@ class ModelOutputsVisualizer:
             step_num = num_steps - i
             img_uint8 = (np.clip(noise_img, 0, 1) * 255).astype(np.uint8)
             img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(output_dir / f"{img_name}_noisepredictor_step{step_num}.png"), img_bgr)
+            cv2.imwrite(str(output_dir / f"{img_name}_step{step_num:03d}_noise.png"), img_bgr)
 
-        print(f"    保存噪声图像到: {output_dir}")
+
+        print(f"    保存噪声预测图像到: {output_dir}")
 
     def run(self, input_path, output_path):
         """
@@ -777,7 +789,7 @@ class ModelOutputsVisualizer:
 
 
 def get_parser():
-    parser = argparse.ArgumentParser(description="Initializer和NoisePredictor输出可视化脚本")
+    parser = argparse.ArgumentParser(description="中间步骤可视化脚本")
     parser.add_argument(
         "-i", "--input",
         type=str,
@@ -818,14 +830,18 @@ def main():
         args.device = 'cpu'
 
     print("=" * 60)
-    print("Initializer和NoisePredictor输出可视化脚本")
+    print("超分中间步骤可视化脚本")
     print("=" * 60)
     print("\n可视化内容：")
-    print("  1. Initializer输出：生成初始噪声预测（用于x_T初始化）")
-    print("  2. NoisePredictor输出：在反向扩散过程中生成每一步的噪声预测")
-    print("\n说明：")
-    print("  Initializer和NoisePredictor都是基于UNet结构的深度学习模型")
-    print("  它们学习预测噪声，用于引导反向扩散过程")
+    print("  1. 超分结果对比：LR图像、初始上采样（SWINIR/Bicubic）、最终结果")
+    print("  2. 噪声预测器输出：每一步预测的噪声图")
+    print("\n输出文件：")
+    print("  - {img_name}_results.png: 超分结果对比图（LR vs 初始上采样 vs 最终结果）")
+    print("  - {img_name}_noise_predictor.png: 噪声预测器输出汇总图")
+    print("  - noise_outputs/{img_name}_stepXXX_noise.png: 噪声预测器的单独输出")
+    print("\n注意：")
+    print("  - SWINIR只在开始时调用一次，用于初始上采样")
+    print("  - 噪声预测器在每一步都被调用，用于生成精确的噪声")
     print("=" * 60)
 
     # 初始化可视化器

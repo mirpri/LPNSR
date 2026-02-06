@@ -108,20 +108,29 @@ class EDSRResidualBlock(nn.Module):
 
 
 class EDSRTimeModulatedBlock(nn.Module):
-    """EDSR residual block with timestep modulation"""
+    """EDSR residual block with timestep FiLM modulation"""
     def __init__(self, channels: int, emb_channels: int, growth_rate: int = 32, res_scale: float = 0.1):
         super().__init__()
         self.res_block = EDSRResidualBlock(channels, growth_rate, res_scale)
-        self.time_mlp = nn.Sequential(
+        self.channels = channels
+
+        # FiLM modulation: learn scale (gamma) and shift (beta) from timestep embedding
+        self.film_mlp = nn.Sequential(
             nn.ReLU(inplace=False),
-            linear(emb_channels, channels),
-            nn.Unflatten(1, (-1, 1, 1))  # Adjust to spatial dimensions
+            linear(emb_channels, channels * 2),  # 2*channels for gamma and beta
         )
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        # Timestep modulation
-        t_mod = self.time_mlp(t_emb)
-        x = x + t_mod  # Time information injection
+        # FiLM modulation parameters
+        film_params = self.film_mlp(t_emb)  # [B, 2*channels]
+        gamma, beta = torch.chunk(film_params, 2, dim=1)  # Split into gamma and beta, each [B, channels]
+
+        # Reshape to [B, channels, 1, 1] for broadcasting
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)  # [B, channels, 1, 1]
+        beta = beta.unsqueeze(-1).unsqueeze(-1)    # [B, channels, 1, 1]
+
+        # Apply FiLM modulation: gamma * x + beta
+        x = gamma * x + beta
 
         # EDSR residual block
         return self.res_block(x)
@@ -154,7 +163,8 @@ class Upsample(nn.Module):
 class EDSRUnetNoisePredictor(nn.Module):
     """
     Noise predictor based on EDSR-Unet architecture
-    Input: intermediate state (z_t), initial LR (lr_latent), timesteps
+    Input: intermediate state (z_t), initial LR image (lr_image), timesteps
+    Note: lr_image is in original image space [-1, 1], similar to ResShift UNet
     """
     def __init__(
         self,
@@ -174,7 +184,7 @@ class EDSRUnetNoisePredictor(nn.Module):
         self.double_z = double_z
 
         # Timestep embedding
-        time_embed_dim = model_channels * 4
+        time_embed_dim = model_channels * 2
         self.time_embed = nn.Sequential(
             linear(model_channels, time_embed_dim),
             nn.ReLU(inplace=False),
@@ -297,18 +307,41 @@ class EDSRUnetNoisePredictor(nn.Module):
     def forward(
         self,
         z_t: torch.Tensor,          # Intermediate state
-        lr_latent: torch.Tensor,    # Initial LR
-        timesteps: torch.Tensor,    # Current timestep
+        lr_image: torch.Tensor,  # Initial LR image (image space [-1, 1])
+        timesteps: torch.Tensor, # Current timestep
         sample_posterior: bool = True,
         generator: Optional[torch.Generator] = None
     ) -> Union[torch.Tensor, DiagonalGaussianDistribution, NoisePredictorOutput]:
+        """
+        Forward pass of the noise predictor.
+
+        Args:
+            z_t: Intermediate state in latent space [B, C, H, W]
+            lr_image: Initial LR image in image space [-1, 1] [B, C, H_lr, W_lr]
+            timesteps: Current timestep [B]
+            sample_posterior: Whether to sample from posterior distribution
+            generator: Random generator for sampling
+
+        Returns:
+            Predicted noise or distribution
+        """
         # Timestep embedding
         t_emb = timestep_embedding(timesteps, self.model_channels)
         t_emb = self.time_embed(t_emb)
 
-        # Input fusion: intermediate state + initial LR
+        # Input processing: intermediate state in latent space
         z_feat = self.z_proj(z_t)
-        lr_feat = self.lr_proj(lr_latent)
+
+        # lr_image is in image space [-1, 1]
+        # Adjust spatial dimensions using interpolation only
+        if lr_image.shape[2:] != z_feat.shape[2:]:
+            lr_image = F.interpolate(lr_image, size=z_feat.shape[2:],
+                                   mode='bilinear', align_corners=False)
+
+        # Project lr_image features (input channels remain constant at 3)
+        lr_feat = self.lr_proj(lr_image)
+
+        # Fuse intermediate state and lr_image features
         x = self.input_fusion(torch.cat([z_feat, lr_feat], dim=1))
 
         # Encoder forward pass
@@ -392,19 +425,19 @@ if __name__ == "__main__":
     batch_size = 2
     timesteps = torch.randint(0, 1000, (batch_size,)).to(device)
     z_t = torch.randn(batch_size, 3, 64, 64).to(device)  # Intermediate state
-    lr_latent = torch.randn(batch_size, 3, 64, 64).to(device)  # Initial LR
+    lr_image = torch.randn(batch_size, 3, 16, 16).to(device)  # Initial LR (image space)
 
     # Test forward pass
     print("=" * 50)
     print("EDSR-Unet Noise Predictor Test")
     print("=" * 50)
 
-    predicted_noise = model(z_t, lr_latent, timesteps, sample_posterior=True)
+    predicted_noise = model(z_t, lr_image, timesteps, sample_posterior=True)
     print(f"Intermediate state shape: {z_t.shape}")
-    print(f"Initial LR shape: {lr_latent.shape}")
+    print(f"Initial LR shape: {lr_image.shape}")
     print(f"Predicted noise shape: {predicted_noise.shape}")
 
-    posterior = model(z_t, lr_latent, timesteps, sample_posterior=False)
+    posterior = model(z_t, lr_image, timesteps, sample_posterior=False)
     print(f"Distribution mean shape: {posterior.mean.shape}")
     print(f"Distribution variance shape: {posterior.var.shape}")
 
