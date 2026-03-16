@@ -37,16 +37,16 @@ real-world datasets without any text-to-image priors.
       <th>SR Image</th>
     </tr>
     <tr>
-      <td><img src="testdata/RealSet80/oldphoto6.png" width="300"></td>
+      <td><img src="assets/RealSet80/oldphoto6.png" width="300"></td>
       <td><img src="results/oldphoto6_sr.png" width="300"></td>
     </tr>
     <tr>
-      <td><img src="testdata/RealSet80/Lincoln.png" width="300"></td>
+      <td><img src="assets/RealSet80/Lincoln.png" width="300"></td>
       <td><img src="results/Lincoln_sr.png" width="300"></td>
     </tr>
     <tr>
-      <td><img src="testdata/RealSet80/0003.jpg" width="300"></td>
-      <td><img src="LPNSR/results/0003_sr.png" width="300"></td>
+      <td><img src="assets/RealSet80/0003.jpg" width="300"></td>
+      <td><img src="results/0003_sr.png" width="300"></td>
     </tr>
   </table>
 </div>
