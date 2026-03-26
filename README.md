@@ -133,7 +133,7 @@ python train_noise_predictor.py --config LPNSRconfigs/train_noise_predictor.yaml
 
 ## Reproducing the results in our paper
 ### :red_car: Prepare data
-Download datasets used in our paper [Hugging Face](https://huggingface.co/mirpri/LPNSR) or [腾讯微云](https://share.weiyun.com/2P35qGWJ) (password: `qdhijm`),and place them in the `testdata/` folder
+Download datasets used in our paper from [Hugging Face](https://huggingface.co/datasets/mirpri/LPNSR) or [腾讯微云](https://share.weiyun.com/2P35qGWJ) (password: `qdhijm`), and place them in the `testdata/` folder
 
 ### :rocket: Begin Testing
 ```bash
